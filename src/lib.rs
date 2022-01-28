@@ -1133,7 +1133,7 @@ impl Iterator for Walk<'_> {
 //       object safe `ToTokens` trait instead. This allows for a variety of
 //       types to be combined in an `any` call and would be especially useful if
 //       additional combinators are introduced (namely a `Not` combinator, as
-//       `All` is a bit odd and not very useful in this context.
+//       `All` is a bit odd and not very useful in this context).
 /// Combinator that emits a [`Pattern`] that matches if any of its input
 /// [`Pattern`]s match.
 ///
@@ -2209,5 +2209,7 @@ mod tests {
         assert!(Glob::new("<a/..>").unwrap().has_semantic_literals());
         assert!(Glob::new("<a/{b,..,c}/d>").unwrap().has_semantic_literals());
         assert!(Glob::new("./*.txt").unwrap().has_semantic_literals());
+
+        assert!(!Glob::new("<a/b{c,..,d}e/f>").unwrap().has_semantic_literals());
     }
 }

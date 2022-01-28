@@ -944,6 +944,13 @@ where
             vec![(component, literal)]
         }
         else {
+            // TODO: Descending into any and all groups yields odd results (and
+            //       false positives in `has_semantic_literals`). Consider
+            //       `a/b{c,..,d}e/f`. There are no semantic literals, as the
+            //       `..` is always joined into `a..e`. Also consider
+            //       `a/{b,.}{c,.}/d`. This may form `a/../d`, which includes a
+            //       semantic literal. Similarly, `a/.{b,.}/c` may form
+            //       `a/../c`.
             component
                 .tokens()
                 .iter()

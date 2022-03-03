@@ -231,11 +231,9 @@ pub struct Negation {
 }
 
 impl Negation {
-    pub fn try_from_patterns<'n, P>(
-        patterns: impl IntoIterator<Item = P>,
-    ) -> Result<Self, GlobError<'n>>
+    pub fn try_from_patterns<'n, P>(patterns: impl IntoIterator<Item = P>) -> Result<Self, P::Error>
     where
-        P: TryInto<Glob<'n>, Error = GlobError<'n>>,
+        P: TryInto<Glob<'n>>,
     {
         use crate::token::{TokenKind, Wildcard};
 
@@ -392,9 +390,9 @@ impl<'g> Walk<'g, ()> {
     pub fn not<'n, P>(
         self,
         patterns: impl IntoIterator<Item = P>,
-    ) -> Result<Walk<'g, Negation>, GlobError<'n>>
+    ) -> Result<Walk<'g, Negation>, P::Error>
     where
-        P: TryInto<Glob<'n>, Error = GlobError<'n>>,
+        P: TryInto<Glob<'n>>,
     {
         let negation = Negation::try_from_patterns(patterns)?;
         let Walk {

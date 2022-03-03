@@ -17,6 +17,7 @@
 mod capture;
 mod diagnostics;
 mod encode;
+mod expression;
 mod rule;
 mod token;
 mod walk;
@@ -27,10 +28,11 @@ use itertools::{Itertools as _, Position};
 use miette::Diagnostic;
 use regex::Regex;
 use std::borrow::{Borrow, Cow};
+use std::convert::Infallible;
 use std::ffi::OsStr;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::iter::Fuse;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::str::{self, FromStr};
 use thiserror::Error;
 
@@ -38,6 +40,7 @@ use thiserror::Error;
 use crate::diagnostics::inspect;
 #[cfg(feature = "diagnostics-report")]
 use crate::diagnostics::report::{self, BoxedDiagnostic};
+use crate::expression::ToExpression;
 use crate::token::{Annotation, IntoTokens, Token, Tokenized};
 
 pub use crate::capture::MatchedText;
@@ -47,6 +50,7 @@ pub use crate::diagnostics::inspect::CapturingToken;
 pub use crate::diagnostics::report::{DiagnosticGlob, DiagnosticResult, DiagnosticResultExt};
 #[cfg(feature = "diagnostics-inspect")]
 pub use crate::diagnostics::Span;
+pub use crate::expression::PathError;
 pub use crate::rule::RuleError;
 pub use crate::token::ParseError;
 pub use crate::walk::{Walk, WalkEntry, WalkError};
@@ -189,38 +193,6 @@ where
     }
 }
 
-trait PathExt {
-    fn to_expression(&self) -> Result<String, PathError>;
-}
-
-impl PathExt for Path {
-    fn to_expression(&self) -> Result<String, PathError> {
-        let (components, has_root) = self
-            .components()
-            .map(|component| match component {
-                Component::Normal(text) => Ok(Some(text)),
-                Component::RootDir => Ok(None),
-                _ => Err(PathError),
-            })
-            .fold_ok(
-                (vec![], false),
-                |(mut components, has_root), component| match component {
-                    Some(text) => {
-                        let path = CandidatePath::from(text);
-                        components.push(path.text.into_owned());
-                        (components, has_root)
-                    },
-                    None => (components, true),
-                },
-            )?;
-        Ok(format!(
-            "{}{}",
-            if has_root { "/" } else { "" },
-            components.join("/"),
-        ))
-    }
-}
-
 trait PositionExt<T> {
     fn as_tuple(&self) -> (Position<()>, &T);
 
@@ -336,71 +308,93 @@ pub trait Join {
     fn join(self) -> Result<Self::Output, Self::Error>;
 }
 
-impl<'t, P> Join for (P, Glob<'t>)
+// The primary implementation of joins is performed against glob expressions.
+// This is a bit unfortunate, as a `Tokenized` with span annotations better
+// describes a pattern and has enough information to construct a joined
+// expression. However, as good as that may sound, in practice it is still
+// tricky to implement. Worse still, it interacts with Cargo features: tokens
+// are not always annotated with spans. It could be confusing to feature gate
+// joins on diagnostic features and more confusing still to provide different
+// implementations with different performance based on diagnostic features.
+//
+// This approach works fairly well when joining expressions and paths and has a
+// fairly straightforward and short implementation. When joining `Glob`s,
+// significant work is discarded, as the previously parsed tokens are ignored.
+impl Join for (&'_ str, &'_ str) {
+    type Output = Glob<'static>;
+    type Error = GlobError<'static>;
+
+    fn join(self) -> Result<Self::Output, Self::Error> {
+        let (left, right) = self;
+        // Parse one of the subexpressions. This prevents joining nonsense
+        // expressions into valid expressions.
+        token::parse(if left.len() < right.len() {
+            left
+        }
+        else {
+            right
+        })
+        .map_err(ParseError::into_owned)?;
+        let mut expression = expression::components(left)
+            .chain(expression::components(right))
+            .coalesce(|previous, component| match (previous, component) {
+                ("**", "**") => Ok(component),
+                _ => Err((previous, component)),
+            })
+            .join("/");
+        if left.chars().next().map(|x| x == '/').unwrap_or(false) {
+            expression.insert(0, '/');
+        }
+        Glob::new(&expression)
+            .map(Glob::into_owned)
+            .map_err(GlobError::into_owned)
+    }
+}
+
+impl<T> Join for (&'_ str, &'_ T)
 where
-    P: TryInto<Tokenized<'t>>,
-    // It is not possible to refer to `Self::Error` and `P::Error` in this
-    // bound, because it causes an infinite recursion.
-    GlobError<'t>: From<P::Error>,
+    T: ?Sized + ToExpression,
+    GlobError<'static>: From<T::Error>,
 {
-    type Output = Glob<'t>;
-    type Error = GlobError<'t>;
+    type Output = Glob<'static>;
+    type Error = GlobError<'static>;
 
     fn join(self) -> Result<Self::Output, Self::Error> {
         let (left, right) = self;
-        let left = left.try_into()?;
-        let Glob {
-            tokenized: right, ..
-        } = right;
-        left.join(right).try_into()
+        join(left, right.to_expression()?.as_ref())
     }
 }
 
-impl<'t, P> Join for (Glob<'t>, P)
+impl<T> Join for (&'_ T, &'_ str)
 where
-    P: TryInto<Tokenized<'t>>,
-    // It is not possible to refer to `Self::Error` and `P::Error` in this
-    // bound, because it causes an infinite recursion.
-    GlobError<'t>: From<P::Error>,
+    T: ?Sized + ToExpression,
+    GlobError<'static>: From<T::Error>,
 {
-    type Output = Glob<'t>;
-    type Error = GlobError<'t>;
+    type Output = Glob<'static>;
+    type Error = GlobError<'static>;
 
     fn join(self) -> Result<Self::Output, Self::Error> {
         let (left, right) = self;
-        let Glob {
-            tokenized: left, ..
-        } = left;
-        let right = right.try_into()?;
-        left.join(right).try_into()
+        join(left.to_expression()?.as_ref(), right)
     }
 }
 
-impl<'t> Join for (Glob<'t>, Glob<'t>) {
-    type Output = Glob<'t>;
-    type Error = GlobError<'t>;
+impl<T, U> Join for (&'_ T, &'_ U)
+where
+    T: ?Sized + ToExpression,
+    GlobError<'static>: From<T::Error>,
+    U: ?Sized + ToExpression,
+    GlobError<'static>: From<U::Error>,
+{
+    type Output = Glob<'static>;
+    type Error = GlobError<'static>;
 
     fn join(self) -> Result<Self::Output, Self::Error> {
         let (left, right) = self;
-        let Glob {
-            tokenized: left, ..
-        } = left;
-        let Glob {
-            tokenized: right, ..
-        } = right;
-        left.join(right).try_into()
-    }
-}
-
-#[derive(Clone, Debug, Error)]
-#[error("incompatible path")]
-pub struct PathError;
-
-#[cfg(feature = "diagnostics-report")]
-#[cfg_attr(docsrs, doc(cfg(feature = "diagnostics-report")))]
-impl Diagnostic for PathError {
-    fn code<'a>(&'a self) -> Option<Box<dyn 'a + Display>> {
-        Some(Box::new(String::from("wax::glob::incompatible_path")))
+        join(
+            left.to_expression()?.as_ref(),
+            right.to_expression()?.as_ref(),
+        )
     }
 }
 
@@ -471,6 +465,12 @@ impl<'t> GlobError<'t> {
             GlobError::Rule(error) => GlobError::Rule(error.into_owned()),
             GlobError::Walk(error) => GlobError::Walk(error),
         }
+    }
+}
+
+impl From<Infallible> for GlobError<'_> {
+    fn from(_: Infallible) -> Self {
+        unreachable!()
     }
 }
 
@@ -791,7 +791,7 @@ impl<'t> Glob<'t> {
     /// let glob = Glob::new("**/*.(?i){jpg,jpeg,png}").unwrap();
     /// for entry in glob
     ///     .walk("./Pictures", usize::MAX)
-    ///     .not(["**/(i?){background<s:0,1>,wallpaper<s:0,1>}/**"])
+    ///     .not(["(i?){background<s:0,1>,wallpaper<s:0,1>}/**"])
     ///     .unwrap()
     /// {
     ///     let entry = entry.unwrap();
@@ -936,6 +936,14 @@ impl<'t> Pattern<'t> for Glob<'t> {
 
     fn matched<'p>(&self, path: &'p CandidatePath<'_>) -> Option<MatchedText<'p>> {
         self.regex.captures(path.as_ref()).map(From::from)
+    }
+}
+
+impl ToExpression for Glob<'_> {
+    type Error = Infallible;
+
+    fn to_expression(&self) -> Result<Cow<str>, Self::Error> {
+        Ok(self.tokenized.expression().clone())
     }
 }
 
@@ -1355,6 +1363,47 @@ mod tests {
         );
         assert_eq!(crate::escape("左{}右"), "左\\{\\}右");
         assert_eq!(crate::escape("*中*"), "\\*中\\*");
+    }
+
+    #[test]
+    fn join() {
+        fn joinx(left: &str, right: &str) -> String {
+            crate::join(left, right)
+                .unwrap()
+                .tokenized
+                .expression()
+                .clone()
+                .into_owned()
+        }
+
+        assert_eq!(joinx("", ""), "");
+        assert_eq!(joinx("a", ""), "a");
+        assert_eq!(joinx("", "b"), "b");
+        assert_eq!(joinx("a", "b"), "a/b");
+        assert_eq!(joinx("a/", "b"), "a/b");
+        assert_eq!(joinx("a", "/b"), "a/b");
+        assert_eq!(joinx("a/", "/b"), "a/b");
+        assert_eq!(joinx("a/**", "b"), "a/**/b");
+        assert_eq!(joinx("a/**/", "b"), "a/**/b");
+        assert_eq!(joinx("a/**/", "/b"), "a/**/b");
+        assert_eq!(joinx("a/**/", "**/b"), "a/**/b");
+        assert_eq!(joinx("a/**/", "/**/b"), "a/**/b");
+        assert_eq!(joinx("**", ""), "**");
+        assert_eq!(joinx("**", "**"), "**");
+        assert_eq!(joinx("a/{b/c,d}", "e"), "a/{b/c,d}/e");
+        assert_eq!(joinx("a/<b/c:0,>", "d"), "a/<b/c:0,>/d");
+        assert_eq!(joinx("a/{<b/c:0,>,d/e}", "f"), "a/{<b/c:0,>,d/e}/f");
+        assert_eq!(joinx("/a", "b"), "/a/b");
+        assert_eq!(joinx("/**", "b"), "/**/b");
+
+        assert_eq!(joinx("ä/b", "öü"), "ä/b/öü");
+        assert_eq!(joinx("面白くて", "楽しくて"), "面白くて/楽しくて");
+
+        assert!(crate::join("a/{b/,c}", "d").is_err());
+        assert!(crate::join("a/<b/:0,>", "c").is_err());
+        assert!(crate::join("{a/,b}", "{c,d}").is_err());
+        assert!(crate::join("{a,", "b}").is_err());
+        assert!(crate::join("<a", "b>").is_err());
     }
 
     #[test]

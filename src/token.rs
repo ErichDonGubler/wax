@@ -23,16 +23,14 @@ use std::cmp;
 use std::fmt::{self, Display, Formatter};
 use std::mem;
 use std::ops::{Bound, Deref, RangeBounds};
-use std::path::{Path, PathBuf, MAIN_SEPARATOR};
+use std::path::{PathBuf, MAIN_SEPARATOR};
 use std::str::FromStr;
 use supreme::{BaseErrorKind, StackContext};
 use thiserror::Error;
 
 #[cfg(any(feature = "diagnostics-inspect", feature = "diagnostics-report"))]
 use crate::diagnostics::Span;
-use crate::{
-    GlobError, PathExt as _, SliceExt as _, StrExt as _, Terminals, PATHS_ARE_CASE_INSENSITIVE,
-};
+use crate::{SliceExt as _, StrExt as _, Terminals, PATHS_ARE_CASE_INSENSITIVE};
 
 #[cfg(any(feature = "diagnostics-inspect", feature = "diagnostics-report"))]
 pub type Annotation = Span;
@@ -303,7 +301,7 @@ enum FlagToggle {
 
 #[derive(Clone, Debug)]
 pub struct Tokenized<'t, A = Annotation> {
-    expression: Option<Cow<'t, str>>,
+    expression: Cow<'t, str>,
     tokens: Vec<Token<'t, A>>,
 }
 
@@ -311,7 +309,7 @@ impl<'t, A> Tokenized<'t, A> {
     pub fn into_owned(self) -> Tokenized<'static, A> {
         let Tokenized { expression, tokens } = self;
         Tokenized {
-            expression: expression.map(|expression| expression.into_owned().into()),
+            expression: expression.into_owned().into(),
             tokens: tokens.into_iter().map(Token::into_owned).collect(),
         }
     }
@@ -329,49 +327,8 @@ impl<'t, A> Tokenized<'t, A> {
         (prefix, self)
     }
 
-    pub fn join(self, other: Self) -> Self {
-        use crate::token::Wildcard::Tree;
-        use TokenKind::{Separator, Wildcard};
-
-        let Tokenized {
-            tokens: mut left, ..
-        } = self;
-        let Tokenized {
-            tokens: mut right, ..
-        } = other;
-        match left
-            .last()
-            .map(Token::kind)
-            .and_then(|left| right.first().map(Token::kind).map(|right| (left, right)))
-        {
-            Some((Separator, Separator))
-            | Some((Wildcard(Tree { .. }), Wildcard(Tree { .. })))
-            | Some((Separator, Wildcard(Tree { .. }))) => {
-                left.pop();
-            },
-            Some((Wildcard(Tree { .. }), Separator)) => {
-                right.remove(0);
-            },
-            _ => {},
-        }
-        Tokenized {
-            expression: None,
-            tokens: left.into_iter().chain(right).collect(),
-        }
-    }
-
-    pub fn expression(&self) -> Cow<'t, str> {
-        match self.expression {
-            Some(ref expression) => expression.clone(),
-            None => self
-                .tokens
-                .iter()
-                .fold(String::new(), |mut expression, token| {
-                    expression.push_str(&token.to_expression());
-                    expression
-                })
-                .into(),
-        }
+    pub fn expression(&self) -> &Cow<'t, str> {
+        &self.expression
     }
 
     pub fn tokens(&self) -> &[Token<'t, A>] {
@@ -385,26 +342,6 @@ impl<'t, A> IntoTokens<'t> for Tokenized<'t, A> {
     fn into_tokens(self) -> Vec<Token<'t, Self::Annotation>> {
         let Tokenized { tokens, .. } = self;
         tokens
-    }
-}
-
-impl<'t> TryFrom<&'t str> for Tokenized<'t> {
-    type Error = ParseError<'t>;
-
-    fn try_from(expression: &'t str) -> Result<Self, Self::Error> {
-        parse(expression)
-    }
-}
-
-impl<'p> TryFrom<&'p Path> for Tokenized<'static> {
-    type Error = GlobError<'static>;
-
-    fn try_from(path: &'p Path) -> Result<Self, Self::Error> {
-        let expression = path.to_expression()?;
-        let tokenized = parse(&expression)
-            .map(Tokenized::into_owned)
-            .map_err(ParseError::into_owned)?;
-        Ok(tokenized)
     }
 }
 
@@ -562,17 +499,6 @@ impl<'t, A> TokenKind<'t, A> {
         }
     }
 
-    pub fn to_expression(&self) -> String {
-        match self {
-            TokenKind::Alternative(ref alternative) => alternative.to_expression(),
-            TokenKind::Class(ref class) => class.to_expression(),
-            TokenKind::Literal(ref literal) => literal.to_expression(),
-            TokenKind::Repetition(ref repetition) => repetition.to_expression(),
-            TokenKind::Separator => MAIN_SEPARATOR.to_string(),
-            TokenKind::Wildcard(ref wildcard) => wildcard.to_expression(),
-        }
-    }
-
     pub fn to_invariant_string(&self) -> Option<Cow<str>> {
         match self {
             TokenKind::Alternative(ref alternative) => alternative.to_invariant_string(),
@@ -658,20 +584,6 @@ impl<'t, A> Alternative<'t, A> {
         &self.0
     }
 
-    pub fn to_expression(&self) -> String {
-        let subexpressions = self
-            .branches()
-            .iter()
-            .map(|tokens| {
-                tokens.iter().fold(String::new(), |mut expression, token| {
-                    expression.push_str(&token.to_expression());
-                    expression
-                })
-            })
-            .join(",");
-        format!("{{{}}}", subexpressions)
-    }
-
     pub fn to_invariant_string(&self) -> Option<Cow<str>> {
         match self.0.terminals() {
             Some(Terminals::Only(tokens)) => fold_invariant_strings(tokens.iter()),
@@ -718,13 +630,6 @@ pub enum Archetype {
 }
 
 impl Archetype {
-    pub fn to_expression(self) -> String {
-        match self {
-            Archetype::Character(x) => x.to_string(),
-            Archetype::Range(a, b) => format!("{}-{}", a, b),
-        }
-    }
-
     // Using a `&self` receiver interacts better with `Cow` and is more
     // consistent with this method on other token types.
     #[allow(clippy::wrong_self_convention)]
@@ -765,17 +670,6 @@ impl Class {
         self.is_negated
     }
 
-    pub fn to_expression(&self) -> String {
-        let archetypes =
-            self.archetypes
-                .iter()
-                .fold(String::from(""), |mut expression, archetype| {
-                    expression.push_str(&archetype.to_expression());
-                    expression
-                });
-        format!("[{}{}]", if self.is_negated { "!" } else { "" }, archetypes)
-    }
-
     pub fn to_invariant_string(&self) -> Option<Cow<str>> {
         (!self.is_negated)
             .then(|| match self.archetypes.terminals() {
@@ -802,19 +696,6 @@ pub struct Literal<'t> {
 impl<'t> Literal<'t> {
     pub fn text(&self) -> &str {
         self.text.as_ref()
-    }
-
-    pub fn to_expression(&self) -> String {
-        format!(
-            "{}{}",
-            if self.is_case_insensitive {
-                "(?i)"
-            }
-            else {
-                "(?-i)"
-            },
-            self.text
-        )
     }
 
     pub fn to_invariant_string(&self) -> Option<Cow<str>> {
@@ -900,27 +781,6 @@ impl<'t, A> Repetition<'t, A> {
         (self.lower, self.step.map(|step| self.lower + step))
     }
 
-    pub fn to_expression(&self) -> String {
-        let subexpression = self
-            .tokens()
-            .iter()
-            .fold(String::new(), |mut expression, token| {
-                expression.push_str(&token.to_expression());
-                expression
-            });
-        format!(
-            "<{}:{},{}>",
-            subexpression,
-            self.lower,
-            if let Some(step) = self.step.as_ref() {
-                format!("{}", self.lower + step)
-            }
-            else {
-                "".into()
-            }
-        )
-    }
-
     pub fn to_invariant_string(&self) -> Option<Cow<str>> {
         matches!(self.step, Some(0))
             .then(|| {
@@ -954,19 +814,6 @@ pub enum Wildcard {
     One,
     ZeroOrMore(Evaluation),
     Tree { is_rooted: bool },
-}
-
-impl Wildcard {
-    pub fn to_expression(&self) -> String {
-        match self {
-            Wildcard::One => "?".into(),
-            Wildcard::ZeroOrMore(ref evaluation) => match evaluation {
-                Evaluation::Eager => "*".into(),
-                Evaluation::Lazy => "$".into(),
-            },
-            Wildcard::Tree { ref is_rooted } => format!("{}**/", if *is_rooted { "/" } else { "" }),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -1530,7 +1377,7 @@ pub fn parse(expression: &str) -> Result<Tokenized, ParseError> {
 
     if expression.is_empty() {
         Ok(Tokenized {
-            expression: Some(expression.into()),
+            expression: expression.into(),
             tokens: vec![],
         })
     }
@@ -1540,7 +1387,7 @@ pub fn parse(expression: &str) -> Result<Tokenized, ParseError> {
             .map(|(_, tokens)| tokens)
             .map_err(|error| ParseError::new(expression, error))?;
         Ok(Tokenized {
-            expression: Some(expression.into()),
+            expression: expression.into(),
             tokens,
         })
     }

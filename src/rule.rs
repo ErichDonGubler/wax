@@ -137,7 +137,7 @@ fn boundary<'t>(tokenized: &Tokenized<'t>) -> Result<(), RuleError<'t>> {
         .map(|(left, right)| (*left.annotation(), *right.annotation()))
     {
         Err(RuleError::new(
-            tokenized.expression(),
+            tokenized.expression().clone(),
             ErrorKind::AdjacentBoundary,
             #[cfg(feature = "diagnostics-report")]
             CompositeSourceSpan::span(
@@ -481,6 +481,9 @@ fn group<'t>(tokenized: &Tokenized<'t>) -> Result<(), RuleError<'t>> {
         }
     }
 
-    let expression = tokenized.expression();
-    recurse(&expression, tokenized.tokens(), Default::default())
+    recurse(
+        tokenized.expression(),
+        tokenized.tokens(),
+        Default::default(),
+    )
 }

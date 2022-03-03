@@ -125,7 +125,7 @@ fn walk_with_not() {
     let glob = Glob::new("**/*.{md,rs}").unwrap();
     let paths: HashSet<_> = glob
         .walk(&path, usize::MAX)
-        .not(["**/tests/**"])
+        .not(["tests/**"])
         .unwrap()
         .flatten()
         .map(|entry| entry.into_path())

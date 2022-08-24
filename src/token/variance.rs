@@ -1,4 +1,4 @@
-use itertools::Itertools as _;
+use itertools::{FoldWhile, Itertools as _};
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::ops::{Add, Mul};
@@ -49,27 +49,33 @@ where
     T: Invariance,
 {
     fn disjunctive_variance(self) -> Variance<T> {
-        // TODO: This implementation is incomplete. Unbounded variance (and
-        //       unbounded depth) are "infectious" when disjunctive. If any unit
-        //       variance is variant and unbounded (open), then the disjunctive
-        //       variance should be the same.
-        // There are three distinct possibilities for disjunctive variance.
+        use Boundedness::{Closed, Open};
+        use Variance::Variant;
+
+        // There are four possibilities for disjunctive variance here.
         //
         //   - The iterator is empty and there are no unit variances to
         //     consider. The disjunctive variance is the empty invariant.
+        //   - The iterator is non-empty and any unit variance is variant and
+        //     unbounded (open). The disjunctive variance is variant and
+        //     unbounded (open).
         //   - The iterator is non-empty and all unit variances are equal. The
         //     disjunctive variance is the same as any of the like unit
         //     variances.
         //   - The iterator is non-empty and the unit variances are **not** all
-        //     equal. The disjunctive variance is variant and bounded (closed).
+        //     equal (and none are variant and unbounded). The disjunctive
+        //     variance is variant and bounded (closed).
         let mut variances = self.map(UnitVariance::unit_variance).fuse();
         let first = variances
             .next()
             .unwrap_or_else(|| Variance::Invariant(T::empty()));
         variances
-            .all(|variance| first == variance)
-            .then(|| first)
-            .unwrap_or(Variance::Variant(Boundedness::Closed))
+            .fold_while(first, |sum, summand| match (&sum, &summand) {
+                (Variant(Open), _) | (_, Variant(Open)) => FoldWhile::Done(Variant(Open)),
+                _ if sum == summand => FoldWhile::Continue(summand),
+                _ => FoldWhile::Continue(Variant(Closed)),
+            })
+            .into_inner()
     }
 }
 
@@ -519,19 +525,15 @@ where
         // express a root in invariant prefixes.
         prefix.push_str(separator);
     }
-    // TODO: Replace `map`, `take_while`, and `flatten` with `map_while`
-    //       when it stabilizes.
     prefix.push_str(
         &token::components(tokens)
-            .map(|component| {
+            .map_while(|component| {
                 component
                     .variance::<InvariantText>()
                     .as_invariance()
                     .map(InvariantText::to_string)
                     .map(Cow::into_owned)
             })
-            .take_while(Option::is_some)
-            .flatten()
             .join(separator),
     );
     prefix

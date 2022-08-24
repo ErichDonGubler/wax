@@ -981,8 +981,12 @@ impl<'t> Glob<'t> {
     ///
     /// [`Glob::partition`]: crate::Glob::partition
     pub fn has_semantic_literals(&self) -> bool {
-        token::literals(self.tree.as_ref().tokens())
-            .any(|(_, literal)| literal.is_semantic_literal())
+        self.tree
+            .as_ref()
+            .walk()
+            .components()
+            .filter_map(|(_, component)| component.literal())
+            .any(|literal| literal.is_semantic())
     }
 }
 

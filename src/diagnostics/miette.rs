@@ -6,7 +6,7 @@ use tardar::BoxedDiagnostic;
 use thiserror::Error;
 
 use crate::diagnostics::SpanExt as _;
-use crate::token::{self, TokenKind, TokenTree, Tokenized};
+use crate::token::{TokenKind, TokenTree, Tokenized};
 
 #[derive(Clone, Debug, Diagnostic, Error)]
 #[diagnostic(code(wax::glob::semantic_literal), severity(warning))]
@@ -32,11 +32,12 @@ pub struct TerminatingSeparatorWarning<'t> {
 pub fn diagnose<'i, 't>(
     tokenized: &'i Tokenized<'t>,
 ) -> impl 'i + Iterator<Item = BoxedDiagnostic<'t>> {
-    None.into_iter()
-        .chain(
-            token::literals(tokenized.tokens())
-                .filter(|(_, literal)| literal.is_semantic_literal())
-                .map(|(component, literal)| {
+    tokenized
+        .walk()
+        .components()
+        .filter_map(|(_, component)| {
+            component.literal().and_then(|literal| {
+                literal.is_semantic().then(|| {
                     Box::new(SemanticLiteralWarning {
                         expression: tokenized.expression().clone(),
                         literal: literal.text().clone(),
@@ -48,9 +49,10 @@ pub fn diagnose<'i, 't>(
                             .map(SourceSpan::from)
                             .expect("no tokens in component"),
                     }) as BoxedDiagnostic
-                }),
-        )
-        .chain(tokenized.tokens().last().into_iter().filter_map(|token| {
+                })
+            })
+        })
+        .chain(tokenized.tokens().last().and_then(|token| {
             matches!(token.kind(), TokenKind::Separator(_)).then(|| {
                 Box::new(TerminatingSeparatorWarning {
                     expression: tokenized.expression().clone(),

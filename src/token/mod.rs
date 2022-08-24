@@ -170,7 +170,7 @@ impl<'t, A> Token<'t, A> {
     }
 
     pub fn has_root(&self) -> bool {
-        self.walk().starting().any(|(_, token)| {
+        starting(self.walk()).any(|(_, token)| {
             matches!(
                 token.kind(),
                 TokenKind::Separator(_) | TokenKind::Wildcard(Wildcard::Tree { has_root: true }),
@@ -832,31 +832,22 @@ where
     't: 'i,
     A: 't,
 {
-    pub fn starting(self) -> impl 'i + Iterator<Item = (Position, &'i Token<'t, A>)> {
-        self.peekable().batching(|tokens| {
-            if let Some((position, token)) = tokens.next() {
-                tokens
-                    .peeking_take_while(|(next, _)| *next == position)
-                    .for_each(drop);
-                Some((position, token))
-            }
-            else {
-                None
-            }
-        })
-    }
-
-    pub fn ending(self) -> impl 'i + Iterator<Item = (Position, &'i Token<'t, A>)> {
-        self.peekable().batching(|tokens| {
-            if let Some((position, _)) = tokens.peek().copied() {
-                tokens
-                    .peeking_take_while(|(next, _)| *next == position)
-                    .last()
-            }
-            else {
-                None
-            }
-        })
+    pub fn components(self) -> impl 'i + Iterator<Item = (Position, Component<'i, 't, A>)> {
+        self.peekable()
+            .batching(|tokens| {
+                tokens.next().map(|(position, token)| {
+                    components(
+                        Some(token).into_iter().chain(
+                            tokens
+                                .peeking_take_while(|(next, _)| *next == position)
+                                .map(|(_, token)| token),
+                        ),
+                    )
+                    .map(|component| (position, component))
+                    .collect::<Vec<_>>()
+                })
+            })
+            .flatten()
     }
 }
 
@@ -939,12 +930,12 @@ impl<'i, 't> LiteralSequence<'i, 't> {
     }
 
     #[cfg(any(unix, windows))]
-    pub fn is_semantic_literal(&self) -> bool {
+    pub fn is_semantic(&self) -> bool {
         matches!(self.text().as_ref(), "." | "..")
     }
 
     #[cfg(not(any(unix, windows)))]
-    pub fn is_semantic_literal(&self) -> bool {
+    pub fn is_semantic(&self) -> bool {
         false
     }
 }
@@ -1038,39 +1029,33 @@ where
     })
 }
 
-// TODO: This implementation allocates many `Vec`s.
-pub fn literals<'i, 't, A, I>(
-    tokens: I,
-) -> impl Iterator<Item = (Component<'i, 't, A>, LiteralSequence<'i, 't>)>
+// TODO:
+pub fn starting<T, I>(items: I) -> impl Iterator<Item = (Position, T)>
 where
-    't: 'i,
-    A: 't,
-    I: IntoIterator<Item = &'i Token<'t, A>>,
+    I: IntoIterator<Item = (Position, T)>,
 {
-    components(tokens).flat_map(|component| {
-        if let Some(literal) = component.literal() {
-            vec![(component, literal)]
-        }
-        else {
-            component
-                .tokens()
-                .iter()
-                .filter_map(|token| match token.kind() {
-                    TokenKind::Alternative(ref alternative) => Some(
-                        alternative
-                            .branches()
-                            .iter()
-                            .flat_map(literals)
-                            .collect::<Vec<_>>(),
-                    ),
-                    TokenKind::Repetition(ref repetition) => {
-                        Some(literals(repetition.tokens()).collect::<Vec<_>>())
-                    },
-                    _ => None,
-                })
-                .flatten()
-                .collect::<Vec<_>>()
-        }
+    items.into_iter().peekable().batching(|tokens| {
+        tokens.next().map(|(position, token)| {
+            tokens
+                .peeking_take_while(|(next, _)| *next == position)
+                .for_each(drop);
+            (position, token)
+        })
+    })
+}
+
+// TODO:
+pub fn ending<T, I>(items: I) -> impl Iterator<Item = (Position, T)>
+where
+    T: Clone,
+    I: IntoIterator<Item = (Position, T)>,
+{
+    items.into_iter().peekable().batching(|tokens| {
+        tokens.peek().cloned().and_then(|(position, _)| {
+            tokens
+                .peeking_take_while(|(next, _)| *next == position)
+                .last()
+        })
     })
 }
 
@@ -1095,5 +1080,19 @@ mod tests {
         assert!(literals[2].is_case_insensitive); // `bar`
         assert!(!literals[3].is_case_insensitive); // `baz`
         assert!(literals[4].is_case_insensitive); // `qux`
+    }
+
+    // TODO:
+    #[test]
+    fn sanity() {
+        let tokenized = token::parse("foo/{bar,baz/qux}").unwrap();
+        for (position, component) in token::ending(tokenized.walk().components()) {
+            if let Some(literal) = component.literal() {
+                eprintln!("{}   :   {:?}", literal.text(), position);
+            }
+            else {
+                eprintln!("non-literal");
+            }
+        }
     }
 }

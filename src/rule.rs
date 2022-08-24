@@ -441,36 +441,26 @@ fn group<'t>(tokenized: &Tokenized<'t>) -> Result<(), RuleError<'t>> {
 
     fn has_starting_component_boundary<'t>(token: Option<&'t Token<'t>>) -> bool {
         token.map_or(false, |token| {
-            token
-                .walk()
-                .starting()
-                .any(|(_, token)| token.is_component_boundary())
+            token::starting(token.walk()).any(|(_, token)| token.is_component_boundary())
         })
     }
 
     fn has_ending_component_boundary<'t>(token: Option<&'t Token<'t>>) -> bool {
         token.map_or(false, |token| {
-            token
-                .walk()
-                .ending()
-                .any(|(_, token)| token.is_component_boundary())
+            token::ending(token.walk()).any(|(_, token)| token.is_component_boundary())
         })
     }
 
     fn has_starting_zom_token<'t>(token: Option<&'t Token<'t>>) -> bool {
         token.map_or(false, |token| {
-            token
-                .walk()
-                .starting()
+            token::starting(token.walk())
                 .any(|(_, token)| matches!(token.kind(), Wildcard(ZeroOrMore(_))))
         })
     }
 
     fn has_ending_zom_token<'t>(token: Option<&'t Token<'t>>) -> bool {
         token.map_or(false, |token| {
-            token
-                .walk()
-                .ending()
+            token::ending(token.walk())
                 .any(|(_, token)| matches!(token.kind(), Wildcard(ZeroOrMore(_))))
         })
     }

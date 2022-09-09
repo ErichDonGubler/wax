@@ -4,7 +4,7 @@ mod variance;
 use itertools::Itertools as _;
 use std::borrow::Cow;
 use std::cmp;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::mem;
 use std::ops::Deref;
 use std::path::{PathBuf, MAIN_SEPARATOR};
@@ -28,6 +28,10 @@ pub trait TokenTree<'t>: Sized {
     fn into_tokens(self) -> Vec<Token<'t, Self::Annotation>>;
 
     fn tokens(&self) -> &[Token<'t, Self::Annotation>];
+
+    fn walk(&self) -> Walk<'_, 't, Self::Annotation> {
+        Walk::from(self.tokens())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -55,10 +59,6 @@ impl<'t, A> Tokenized<'t, A> {
         for<'i> &'i Token<'t, A>: UnitVariance<T>,
     {
         self.tokens().iter().conjunctive_variance()
-    }
-
-    pub fn walk(&self) -> Walk<'_, 't, A> {
-        Walk::from(&self.tokens)
     }
 }
 
@@ -166,20 +166,20 @@ impl<'t, A> Token<'t, A> {
     }
 
     pub fn walk(&self) -> Walk<'_, 't, A> {
-        Walk::from(self)
+        Walk::from(slice::from_ref(self))
     }
 
     pub fn has_root(&self) -> bool {
-        starting(self.walk()).any(|(_, token)| {
+        inclusive_starting_subtree(self.walk()).any(|entry| {
             matches!(
-                token.kind(),
+                entry.kind(),
                 TokenKind::Separator(_) | TokenKind::Wildcard(Wildcard::Tree { has_root: true }),
             )
         })
     }
 
     pub fn has_component_boundary(&self) -> bool {
-        self.walk().any(|(_, token)| token.is_component_boundary())
+        self.walk().any(|entry| entry.is_component_boundary())
     }
 }
 
@@ -663,7 +663,7 @@ impl<'t, A> Repetition<'t, A> {
     }
 
     fn walk(&self) -> Walk<'_, 't, A> {
-        Walk::from(&self.tokens)
+        Walk::from(self.tokens.as_slice())
     }
 }
 
@@ -676,7 +676,7 @@ impl<'i, 't, A> UnitBreadth for &'i Repetition<'t, A> {
 impl<'i, 't, A> UnitDepth for &'i Repetition<'t, A> {
     fn unit_depth(self) -> Boundedness {
         let (_, upper) = self.bounds();
-        if upper.is_none() && self.walk().any(|(_, token)| token.is_component_boundary()) {
+        if upper.is_none() && self.walk().any(|entry| entry.is_component_boundary()) {
             Boundedness::Open
         }
         else {
@@ -779,16 +779,33 @@ impl<'i> UnitDepth for &'i Wildcard {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Position {
-    Conjunctive { depth: usize },
-    Disjunctive { depth: usize, branch: usize },
+    Conjunctive {
+        index: usize,
+        depth: usize,
+    },
+    Disjunctive {
+        index: usize,
+        depth: usize,
+        branch: usize,
+    },
 }
 
 impl Position {
+    pub fn index(&self) -> usize {
+        match self {
+            Position::Conjunctive { ref index, .. } | Position::Disjunctive { ref index, .. } => {
+                *index
+            },
+        }
+    }
+
     pub fn depth(&self) -> usize {
         match self {
-            Position::Conjunctive { ref depth } | Position::Disjunctive { ref depth, .. } => *depth,
+            Position::Conjunctive { ref depth, .. } | Position::Disjunctive { ref depth, .. } => {
+                *depth
+            },
         }
     }
 
@@ -796,8 +813,10 @@ impl Position {
     #[must_use]
     fn converge(self) -> Self {
         match self {
-            Position::Conjunctive { depth } | Position::Disjunctive { depth, .. } => {
-                Position::Conjunctive { depth: depth + 1 }
+            Position::Conjunctive { index, depth, .. }
+            | Position::Disjunctive { index, depth, .. } => Position::Conjunctive {
+                index: index + 1,
+                depth: depth + 1,
             },
         }
     }
@@ -806,25 +825,84 @@ impl Position {
     #[must_use]
     fn diverge(self, branch: usize) -> Self {
         match self {
-            Position::Conjunctive { depth } | Position::Disjunctive { depth, .. } => {
-                Position::Disjunctive {
-                    depth: depth + 1,
-                    branch,
-                }
+            Position::Conjunctive { index, depth, .. }
+            | Position::Disjunctive { index, depth, .. } => Position::Disjunctive {
+                index: index + 1,
+                depth: depth + 1,
+                branch,
             },
+        }
+    }
+
+    fn is_sibling(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Position::Conjunctive {
+                    depth: ref left_depth,
+                    ..
+                },
+                Position::Conjunctive {
+                    depth: ref right_depth,
+                    ..
+                },
+            ) => left_depth == right_depth,
+            (
+                Position::Disjunctive {
+                    depth: ref left_depth,
+                    branch: ref left_branch,
+                    ..
+                },
+                Position::Disjunctive {
+                    depth: ref right_depth,
+                    branch: ref right_branch,
+                    ..
+                },
+            ) => left_depth == right_depth && left_branch == right_branch,
+            _ => false,
         }
     }
 }
 
-impl Default for Position {
-    fn default() -> Self {
-        Position::Conjunctive { depth: 0 }
+#[derive(Clone, Copy, Debug)]
+pub struct WalkEntry<T> {
+    pub parent: Option<Position>,
+    pub position: Position,
+    pub item: T,
+}
+
+impl<T> WalkEntry<T> {
+    pub fn map_item<U, F>(self, f: F) -> WalkEntry<U>
+    where
+        F: FnOnce(T) -> U,
+    {
+        let WalkEntry {
+            parent,
+            position,
+            item,
+        } = self;
+        WalkEntry {
+            parent,
+            position,
+            item: f(item),
+        }
+    }
+
+    pub fn into_item(self) -> T {
+        self.item
+    }
+}
+
+impl<T> Deref for WalkEntry<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.item
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct Walk<'i, 't, A> {
-    buffer: VecDeque<(Position, &'i Token<'t, A>)>,
+    buffer: VecDeque<WalkEntry<&'i Token<'t, A>>>,
 }
 
 impl<'i, 't, A> Walk<'i, 't, A>
@@ -832,18 +910,14 @@ where
     't: 'i,
     A: 't,
 {
-    pub fn components(self) -> impl 'i + Iterator<Item = (Position, Component<'i, 't, A>)> {
+    pub fn components(self) -> impl 'i + Iterator<Item = WalkEntry<Component<'i, 't, A>>> {
         self.peekable()
-            .batching(|tokens| {
-                tokens.next().map(|(position, token)| {
-                    components(
-                        Some(token).into_iter().chain(
-                            tokens
-                                .peeking_take_while(|(next, _)| *next == position)
-                                .map(|(_, token)| token),
-                        ),
-                    )
-                    .map(|component| (position, component))
+            .batching(move |tokens| {
+                tokens.next().map(|first| {
+                    let position = first.position;
+                    components2(Some(first).into_iter().chain(
+                        tokens.peeking_take_while(|entry| entry.position.is_sibling(&position)),
+                    ))
                     .collect::<Vec<_>>()
                 })
             })
@@ -851,20 +925,36 @@ where
     }
 }
 
-impl<'i, 't, A> From<&'i Token<'t, A>> for Walk<'i, 't, A> {
-    fn from(token: &'i Token<'t, A>) -> Self {
-        Walk {
-            buffer: Some((Position::default(), token)).into_iter().collect(),
-        }
-    }
-}
+//impl<'i, 't, A> From<&'i [Token<'t, A>]> for Walk<'i, 't, A> {
+//    fn from(tokens: &'i [Token<'t, A>]) -> Self {
+//        Walk {
+//            buffer: tokens
+//                .iter()
+//                .enumerate()
+//                .map(|(index, token)| WalkEntry {
+//                    parent: None,
+//                    position: Position::Conjunctive { index, depth: 0 },
+//                    item: token,
+//                })
+//                .collect(),
+//        }
+//    }
+//}
 
-impl<'i, 't, A> From<&'i Vec<Token<'t, A>>> for Walk<'i, 't, A> {
-    fn from(tokens: &'i Vec<Token<'t, A>>) -> Self {
+impl<'i, 't, I, A> From<I> for Walk<'i, 't, A>
+where
+    I: IntoIterator<Item = &'i Token<'t, A>>,
+{
+    fn from(tokens: I) -> Self {
         Walk {
             buffer: tokens
-                .iter()
-                .map(|token| (Position::default(), token))
+                .into_iter()
+                .enumerate()
+                .map(|(index, token)| WalkEntry {
+                    parent: None,
+                    position: Position::Conjunctive { index, depth: 0 },
+                    item: token,
+                })
                 .collect(),
         }
     }
@@ -875,32 +965,34 @@ where
     't: 'i,
     A: 't,
 {
-    type Item = (Position, &'i Token<'t, A>);
+    type Item = WalkEntry<&'i Token<'t, A>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some((position, token)) = self.buffer.pop_front() {
-            match token.kind() {
+        if let Some(entry) = self.buffer.pop_front() {
+            match entry.kind() {
                 TokenKind::Alternative(ref alternative) => {
                     self.buffer
                         .extend(alternative.branches().iter().enumerate().flat_map(
                             |(branch, tokens)| {
-                                tokens
-                                    .iter()
-                                    .map(move |token| (position.diverge(branch), token))
+                                tokens.iter().map(move |token| WalkEntry {
+                                    parent: Some(entry.position),
+                                    position: entry.position.diverge(branch),
+                                    item: token,
+                                })
                             },
                         ));
                 },
                 TokenKind::Repetition(ref repetition) => {
-                    self.buffer.extend(
-                        repetition
-                            .tokens()
-                            .iter()
-                            .map(|token| (position.converge(), token)),
-                    );
+                    self.buffer
+                        .extend(repetition.tokens().iter().map(|token| WalkEntry {
+                            parent: Some(entry.position),
+                            position: entry.position.converge(),
+                            item: token,
+                        }));
                 },
                 _ => {},
             }
-            Some((position, token))
+            Some(entry)
         }
         else {
             None
@@ -1029,39 +1121,131 @@ where
     })
 }
 
-// TODO:
-pub fn starting<T, I>(items: I) -> impl Iterator<Item = (Position, T)>
+pub fn components2<'i, 't, A, I>(tokens: I) -> impl Iterator<Item = WalkEntry<Component<'i, 't, A>>>
 where
-    I: IntoIterator<Item = (Position, T)>,
+    't: 'i,
+    A: 't,
+    I: IntoIterator<Item = WalkEntry<&'i Token<'t, A>>>,
 {
-    items.into_iter().peekable().batching(|tokens| {
-        tokens.next().map(|(position, token)| {
-            tokens
-                .peeking_take_while(|(next, _)| *next == position)
-                .for_each(drop);
-            (position, token)
+    tokens
+        .into_iter()
+        .batching(|tokens| {
+            let mut first = tokens.next();
+            while matches!(
+                first.map(|first| first.kind()),
+                Some(TokenKind::Separator(_))
+            ) {
+                first = tokens.next();
+            }
+            first.map(|first| match first.kind() {
+                TokenKind::Wildcard(Wildcard::Tree { .. }) => {
+                    first.map_item(|first| Component(vec![first]))
+                },
+                _ => first.map_item(|first| {
+                    Component(
+                        Some(first)
+                            .into_iter()
+                            .chain(
+                                tokens
+                                    .map(WalkEntry::into_item)
+                                    .peekable()
+                                    .peeking_take_while(|token| !token.is_component_boundary()),
+                            )
+                            .collect(),
+                    )
+                }),
+            })
         })
-    })
+        .fuse()
 }
 
 // TODO:
-pub fn ending<T, I>(items: I) -> impl Iterator<Item = (Position, T)>
+pub fn inclusive_starting_subtree<T, I>(entries: I) -> impl Iterator<Item = WalkEntry<T>>
+where
+    I: IntoIterator<Item = WalkEntry<T>>,
+{
+    entries
+        .into_iter()
+        .peekable()
+        .batching(|entries| {
+            entries.next().map(|first| {
+                entries
+                    .peeking_take_while(|entry| first.position.is_sibling(&entry.position))
+                    .for_each(drop);
+                first
+            })
+        })
+        .fuse()
+}
+
+// TODO:
+pub fn inclusive_ending_subtree<T, I>(entries: I) -> impl Iterator<Item = WalkEntry<T>>
+where
+    I: IntoIterator<Item = WalkEntry<T>>,
+{
+    entries
+        .into_iter()
+        .peekable()
+        .batching(|entries| {
+            entries.next().map(|first| {
+                entries
+                    .peeking_take_while(|entry| first.position.is_sibling(&entry.position))
+                    .last()
+                    .unwrap_or(first)
+            })
+        })
+        .fuse()
+}
+
+pub fn exclusive_ending_subtree<T, I>(entries: I) -> impl Iterator<Item = WalkEntry<T>>
+where
+    I: IntoIterator<Item = WalkEntry<T>>,
+{
+    let mut parents = HashSet::new();
+    entries
+        .into_iter()
+        .peekable()
+        .batching(move |entries| loop {
+            let entry = entries.next().map(|first| {
+                entries
+                    .peeking_take_while(|entry| first.position.is_sibling(&entry.position))
+                    .last()
+                    .unwrap_or(first)
+            });
+            if let Some(entry) = entry {
+                if let Some(parent) = entry.parent {
+                    if !parents.contains(&parent) {
+                        continue;
+                    }
+                }
+                parents.insert(entry.position);
+                return Some(entry);
+            }
+            return None;
+        })
+        .fuse()
+}
+
+pub fn depth<T, I>(entries: I, depth: usize) -> impl Iterator<Item = WalkEntry<T>>
 where
     T: Clone,
-    I: IntoIterator<Item = (Position, T)>,
+    I: IntoIterator<Item = WalkEntry<T>>,
 {
-    items.into_iter().peekable().batching(|tokens| {
-        tokens.peek().cloned().and_then(|(position, _)| {
-            tokens
-                .peeking_take_while(|(next, _)| *next == position)
-                .last()
-        })
-    })
+    entries
+        .into_iter()
+        .take_while(move |entry| entry.position.depth() <= depth)
 }
+
+//fn siblings<T, U, I, F>(entries: I) -> impl Iterator<Item = WalkEntry<U>>
+//where
+//    I: IntoIterator<Item = WalkEntry<T>>,
+//    F: FnMut(()) -> Option<WalkEntry<U>>,
+//{
+//}
 
 #[cfg(test)]
 mod tests {
-    use crate::token::{self, TokenKind, TokenTree};
+    use crate::token::{self, TokenKind, TokenTree, WalkEntry};
 
     #[test]
     fn literal_case_insensitivity() {
@@ -1085,13 +1269,24 @@ mod tests {
     // TODO:
     #[test]
     fn sanity() {
-        let tokenized = token::parse("foo/{bar,baz/qux}").unwrap();
-        for (position, component) in token::ending(tokenized.walk().components()) {
-            if let Some(literal) = component.literal() {
-                eprintln!("{}   :   {:?}", literal.text(), position);
+        let tokenized = token::parse("{a,{b,c}}/{d,e/f}").unwrap();
+        for entry in token::exclusive_ending_subtree(tokenized.walk().components()) {
+            //eprintln!(
+            //    "{:#?}\n{:?} => {:?}\n",
+            //    entry.kind(),
+            //    entry.parent,
+            //    entry.position
+            //);
+            if let Some(literal) = entry.literal() {
+                eprintln!(
+                    "{}   :   {:?} => {:?}",
+                    literal.text(),
+                    entry.parent,
+                    entry.position
+                );
             }
             else {
-                eprintln!("non-literal");
+                eprintln!("%%    :   {:?} => {:?}", entry.parent, entry.position);
             }
         }
     }

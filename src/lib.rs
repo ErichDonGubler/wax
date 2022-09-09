@@ -985,7 +985,7 @@ impl<'t> Glob<'t> {
             .as_ref()
             .walk()
             .components()
-            .filter_map(|(_, component)| component.literal())
+            .filter_map(|entry| entry.literal())
             .any(|literal| literal.is_semantic())
     }
 }

@@ -26,7 +26,7 @@ use std::slice;
 use thiserror::Error;
 
 use crate::diagnostics::{CompositeSpan, CorrelatedSpan, SpanExt as _};
-use crate::token::{self, InvariantSize, Token, TokenKind, TokenTree, Tokenized};
+use crate::token::{self, InvariantSize, Token, TokenKind, TokenTree, Tokenized, WalkEntry};
 use crate::{Any, BuildError, Compose, Glob};
 
 /// Maximum invariant size.
@@ -378,11 +378,15 @@ pub fn check(tokenized: Tokenized) -> Result<Checked<Tokenized>, RuleError> {
 fn boundary<'t>(tokenized: &Tokenized<'t>) -> Result<(), RuleError<'t>> {
     if let Some((left, right)) = tokenized
         .walk()
-        .group_by(|(position, _)| *position)
+        // TODO: This no longer works correctly! This is meant to group
+        //       siblings, but `Position` now includes a unique index! This
+        //       means that the entries are not grouped in any way at all by
+        //       this function.
+        .group_by(|entry| entry.position)
         .into_iter()
-        .flat_map(|(_, group)| {
-            group
-                .map(|(_, token)| token)
+        .flat_map(|(_, entry)| {
+            entry
+                .map(WalkEntry::into_item)
                 .tuple_windows::<(_, _)>()
                 .filter(|(left, right)| {
                     left.is_component_boundary() && right.is_component_boundary()
@@ -441,27 +445,28 @@ fn group<'t>(tokenized: &Tokenized<'t>) -> Result<(), RuleError<'t>> {
 
     fn has_starting_component_boundary<'t>(token: Option<&'t Token<'t>>) -> bool {
         token.map_or(false, |token| {
-            token::starting(token.walk()).any(|(_, token)| token.is_component_boundary())
+            token::inclusive_starting_subtree(token.walk())
+                .any(|entry| entry.is_component_boundary())
         })
     }
 
     fn has_ending_component_boundary<'t>(token: Option<&'t Token<'t>>) -> bool {
         token.map_or(false, |token| {
-            token::ending(token.walk()).any(|(_, token)| token.is_component_boundary())
+            token::inclusive_ending_subtree(token.walk()).any(|entry| entry.is_component_boundary())
         })
     }
 
     fn has_starting_zom_token<'t>(token: Option<&'t Token<'t>>) -> bool {
         token.map_or(false, |token| {
-            token::starting(token.walk())
-                .any(|(_, token)| matches!(token.kind(), Wildcard(ZeroOrMore(_))))
+            token::inclusive_starting_subtree(token.walk())
+                .any(|entry| matches!(entry.kind(), Wildcard(ZeroOrMore(_))))
         })
     }
 
     fn has_ending_zom_token<'t>(token: Option<&'t Token<'t>>) -> bool {
         token.map_or(false, |token| {
-            token::ending(token.walk())
-                .any(|(_, token)| matches!(token.kind(), Wildcard(ZeroOrMore(_))))
+            token::inclusive_ending_subtree(token.walk())
+                .any(|entry| matches!(entry.kind(), Wildcard(ZeroOrMore(_))))
         })
     }
 
@@ -727,7 +732,7 @@ fn group<'t>(tokenized: &Tokenized<'t>) -> Result<(), RuleError<'t>> {
 }
 
 fn bounds<'t>(tokenized: &Tokenized<'t>) -> Result<(), RuleError<'t>> {
-    if let Some((_, token)) = tokenized.walk().find(|(_, token)| match token.kind() {
+    if let Some(entry) = tokenized.walk().find(|entry| match entry.kind() {
         TokenKind::Repetition(ref repetition) => {
             let (lower, upper) = repetition.bounds();
             upper.map_or(false, |upper| upper < lower || upper == 0)
@@ -737,7 +742,7 @@ fn bounds<'t>(tokenized: &Tokenized<'t>) -> Result<(), RuleError<'t>> {
         Err(RuleError::new(
             tokenized.expression().clone(),
             RuleErrorKind::IncompatibleBounds,
-            CompositeSpan::spanned("here", *token.annotation()),
+            CompositeSpan::spanned("here", *entry.annotation()),
         ))
     }
     else {
@@ -746,14 +751,14 @@ fn bounds<'t>(tokenized: &Tokenized<'t>) -> Result<(), RuleError<'t>> {
 }
 
 fn size<'t>(tokenized: &Tokenized<'t>) -> Result<(), RuleError<'t>> {
-    if let Some((_, token)) = tokenized
+    if let Some(entry) = tokenized
         .walk()
         // TODO: This is expensive. For each token tree encountered, the
         //       tree is traversed to determine its variance. If variant,
         //       the tree is traversed and queried again, revisiting the
         //       same tokens to recompute their local variance.
-        .find(|(_, token)| {
-            token
+        .find(|entry| {
+            entry
                 .variance::<InvariantSize>()
                 .as_invariance()
                 .map_or(false, |size| *size >= MAX_INVARIANT_SIZE)
@@ -762,7 +767,7 @@ fn size<'t>(tokenized: &Tokenized<'t>) -> Result<(), RuleError<'t>> {
         Err(RuleError::new(
             tokenized.expression().clone(),
             RuleErrorKind::OversizedInvariant,
-            CompositeSpan::spanned("here", *token.annotation()),
+            CompositeSpan::spanned("here", *entry.annotation()),
         ))
     }
     else {

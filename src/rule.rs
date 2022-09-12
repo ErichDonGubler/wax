@@ -26,7 +26,7 @@ use std::slice;
 use thiserror::Error;
 
 use crate::diagnostics::{CompositeSpan, CorrelatedSpan, SpanExt as _};
-use crate::token::{self, InvariantSize, Token, TokenKind, TokenTree, Tokenized, WalkEntry};
+use crate::token::{self, InvariantSize, Token, TokenKind, TokenTree, Tokenized};
 use crate::{Any, BuildError, Compose, Glob};
 
 /// Maximum invariant size.
@@ -378,15 +378,10 @@ pub fn check(tokenized: Tokenized) -> Result<Checked<Tokenized>, RuleError> {
 fn boundary<'t>(tokenized: &Tokenized<'t>) -> Result<(), RuleError<'t>> {
     if let Some((left, right)) = tokenized
         .walk()
-        // TODO: This no longer works correctly! This is meant to group
-        //       siblings, but `Position` now includes a unique index! This
-        //       means that the entries are not grouped in any way at all by
-        //       this function.
-        .group_by(|entry| entry.position)
+        .group_by(|token| token.position.group)
         .into_iter()
-        .flat_map(|(_, entry)| {
-            entry
-                .map(WalkEntry::into_item)
+        .flat_map(|(_, tokens)| {
+            tokens
                 .tuple_windows::<(_, _)>()
                 .filter(|(left, right)| {
                     left.is_component_boundary() && right.is_component_boundary()

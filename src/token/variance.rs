@@ -518,7 +518,7 @@ where
     let mut prefix = String::new();
     if tokens
         .peek()
-        .map_or(false, |token| !token.has_sub_tokens() && token.has_root())
+        .map_or(false, |token| !token.has_subtree() && token.has_root())
     {
         // Push a preceding separator if the first token has a root and is not a
         // group. This ensures that initiating separators and tree wildcards

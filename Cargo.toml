@@ -34,10 +34,17 @@ walk = ["dep:walkdir"]
 
 [dependencies]
 const_format = "^0.2.0"
-itertools = "^0.10.0"
+#itertools = "^0.10.0"
 nom = "^7.0.0"
 pori = "=0.0.0"
 thiserror = "^1.0.0"
+
+# TODO: Requires patches to `PeekingNext` and `PeekingTakeWhile`.
+# https://github.com/rust-itertools/itertools/pull/643
+# https://github.com/rust-itertools/itertools/pull/644
+[dependencies.itertools]
+version= "^0.10.0"
+path = "../itertools"
 
 [dependencies.miette]
 version = "^5.1.0"

@@ -5,7 +5,6 @@ use std::borrow::Cow;
 use tardar::BoxedDiagnostic;
 use thiserror::Error;
 
-use crate::diagnostics::SpanExt as _;
 use crate::token::{TokenKind, TokenTree, Tokenized};
 
 #[derive(Clone, Debug, Diagnostic, Error)]
@@ -35,17 +34,14 @@ pub fn diagnose<'i, 't>(
     tokenized
         .walk()
         .components()
-        .filter_map(|(_, component)| {
+        .filter_map(|component| {
             component.literal().and_then(|literal| {
                 literal.is_semantic().then(|| {
                     Box::new(SemanticLiteralWarning {
                         expression: tokenized.expression().clone(),
                         literal: literal.text().clone(),
                         span: component
-                            .tokens()
-                            .iter()
-                            .map(|token| *token.annotation())
-                            .reduce(|left, right| left.union(&right))
+                            .span()
                             .map(SourceSpan::from)
                             .expect("no tokens in component"),
                     }) as BoxedDiagnostic

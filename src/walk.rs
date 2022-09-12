@@ -572,7 +572,6 @@ impl<'g> Walk<'g> {
     fn compile<'t, I>(tokens: I) -> Result<Vec<Regex>, CompileError>
     where
         I: IntoIterator<Item = &'t Token<'t>>,
-        I::IntoIter: Clone,
     {
         let mut regexes = Vec::new();
         for component in token::components(tokens) {

@@ -7,6 +7,10 @@ use crate::encode;
 use crate::token::{self, Separator, Token};
 use crate::PATHS_ARE_CASE_INSENSITIVE;
 
+// TODO: Forward implementations of unit traits through `&'_ T` for `T` that
+//       implement those traits. This way, it is not necessary to implement unit
+//       traits over references.
+
 pub trait Invariance:
     Add<Self, Output = Self> + Eq + Mul<usize, Output = Self> + PartialEq<Self> + Sized
 {
@@ -83,6 +87,34 @@ impl<T, I> DisjunctiveVariance<T> for I
 where
     I: Iterator,
     I::Item: UnitVariance<T>,
+    T: Invariance,
+{
+}
+
+pub trait UnitCoda<T>: Sized + UnitVariance<T> {
+    fn unit_coda(self) -> Variance<T> {
+        self.unit_variance()
+    }
+}
+
+impl<T> UnitCoda<T> for Variance<T> {}
+
+pub trait CompositeCoda<T>: Iterator + Sized
+where
+    Self::Item: UnitCoda<T>,
+    T: Invariance,
+{
+    fn composite_coda(self) -> Variance<T> {
+        self.map(UnitCoda::unit_coda)
+            .reduce(Add::add)
+            .unwrap_or_else(|| Variance::Invariant(T::empty()))
+    }
+}
+
+impl<T, I> CompositeCoda<T> for I
+where
+    I: Iterator,
+    I::Item: UnitCoda<T>,
     T: Invariance,
 {
 }
@@ -582,16 +614,19 @@ where
     A: 't,
     I: IntoIterator<Item = &'i Token<'t, A>>,
 {
-    let component = token::components(tokens).last();
-    matches!(
-        component.map(|component| {
-            (
-                component.depth(),
-                component.variance::<InvariantText>().boundedness(),
-            )
-        }),
-        Some((Boundedness::Open, Boundedness::Open)),
-    )
+    //let component = token::components(tokens).last();
+    //matches!(
+    //    component.map(|component| {
+    //        (
+    //            component.depth(),
+    //            component.variance::<InvariantText>().boundedness(),
+    //        )
+    //    }),
+    //    Some((Boundedness::Open, Boundedness::Open)),
+    //)
+    token::components(tokens).last().map_or(false, |component| {
+        component.depth().is_open() && component.coda::<InvariantText>().boundedness().is_open()
+    })
 }
 
 #[cfg(test)]
@@ -669,6 +704,12 @@ mod tests {
         ));
         assert!(token::is_exhaustive(
             token::parse("a/<<?>/>*").unwrap().tokens()
+        ));
+        assert!(token::is_exhaustive(
+            token::parse("<a/**:3>").unwrap().tokens()
+        ));
+        assert!(token::is_exhaustive(
+            token::parse("{a/**,b}").unwrap().tokens()
         ));
 
         assert!(!token::is_exhaustive(

@@ -36,6 +36,7 @@ mod diagnostics;
 mod encode;
 mod rule;
 mod token;
+mod tree;
 mod walk;
 
 use itertools::Position;

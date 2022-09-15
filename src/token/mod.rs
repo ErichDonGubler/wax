@@ -13,9 +13,10 @@ use std::str;
 
 use crate::diagnostics::{Span, SpanExt as _};
 use crate::token::variance::{
-    CompositeBreadth, CompositeDepth, ConjunctiveVariance, DisjunctiveVariance, IntoInvariantText,
-    Invariance, UnitBreadth, UnitDepth, UnitVariance,
+    CompositeBreadth, CompositeCoda, CompositeDepth, ConjunctiveVariance, DisjunctiveVariance,
+    IntoInvariantText, Invariance, UnitBreadth, UnitCoda, UnitDepth, UnitVariance,
 };
+use crate::tree::TreeIterator;
 use crate::{StrExt as _, PATHS_ARE_CASE_INSENSITIVE};
 
 pub use crate::token::parse::{parse, Annotation, ParseError, ROOT_SEPARATOR_EXPRESSION};
@@ -251,6 +252,16 @@ impl<'i, 't, A> UnitBreadth for &'i Token<'t, A> {
     }
 }
 
+impl<'i, 't, A, T> UnitCoda<T> for &'i Token<'t, A>
+where
+    &'i TokenKind<'t, A>: UnitCoda<T>,
+    T: Invariance,
+{
+    fn unit_coda(self) -> Variance<T> {
+        self.kind.unit_coda()
+    }
+}
+
 impl<'i, 't, A> UnitDepth for &'i Token<'t, A> {
     fn unit_depth(self) -> Boundedness {
         self.kind.unit_depth()
@@ -382,6 +393,27 @@ impl<'i, 't, A> UnitBreadth for &'i TokenKind<'t, A> {
     }
 }
 
+impl<'i, 't, A, T> UnitCoda<T> for &'i TokenKind<'t, A>
+where
+    't: 'i,
+    &'i Class: UnitCoda<T>,
+    &'i Literal<'t>: UnitCoda<T>,
+    &'i Separator: UnitCoda<T>,
+    A: 't,
+    T: Invariance,
+{
+    fn unit_coda(self) -> Variance<T> {
+        match self {
+            TokenKind::Alternative(ref alternative) => alternative.unit_coda(),
+            TokenKind::Class(ref class) => class.unit_coda(),
+            TokenKind::Literal(ref literal) => literal.unit_coda(),
+            TokenKind::Repetition(ref repetition) => repetition.unit_coda(),
+            TokenKind::Separator(ref separator) => separator.unit_coda(),
+            TokenKind::Wildcard(_) => Variance::Variant(Boundedness::Open),
+        }
+    }
+}
+
 impl<'i, 't, A> UnitDepth for &'i TokenKind<'t, A> {
     fn unit_depth(self) -> Boundedness {
         match self {
@@ -457,6 +489,21 @@ impl<'i, 't, A> UnitBreadth for &'i Alternative<'t, A> {
     }
 }
 
+impl<'i, 't, A, T> UnitCoda<T> for &'i Alternative<'t, A>
+where
+    't: 'i,
+    A: 't,
+    T: Invariance,
+    &'i Token<'t, A>: UnitCoda<T>,
+{
+    fn unit_coda(self) -> Variance<T> {
+        self.branches()
+            .iter()
+            .flat_map(|tokens| components(tokens).last().map(|component| component.coda()))
+            .disjunctive_variance()
+    }
+}
+
 impl<'i, 't, A> UnitDepth for &'i Alternative<'t, A> {
     fn unit_depth(self) -> Boundedness {
         self.branches()
@@ -520,6 +567,8 @@ impl From<(char, char)> for Archetype {
     }
 }
 
+impl<'i, 't, T> UnitCoda<T> for &'i Archetype where Self: UnitVariance<T> {}
+
 impl<'i, 't> UnitVariance<InvariantText<'t>> for &'i Archetype {
     fn unit_variance(self) -> Variance<InvariantText<'t>> {
         self.domain_variance()
@@ -553,6 +602,13 @@ impl Class {
 }
 
 impl<'i> UnitBreadth for &'i Class {}
+
+impl<'i, T> UnitCoda<T> for &'i Class
+where
+    &'i Archetype: UnitCoda<T>,
+    T: Invariance,
+{
+}
 
 impl<'i> UnitDepth for &'i Class {}
 
@@ -614,6 +670,8 @@ impl<'t> Literal<'t> {
 }
 
 impl<'i, 't> UnitBreadth for &'i Literal<'t> {}
+
+impl<'i, 't, T> UnitCoda<T> for &'i Literal<'t> where Self: UnitVariance<T> {}
 
 impl<'i, 't> UnitDepth for &'i Literal<'t> {}
 
@@ -694,14 +752,66 @@ impl<'i, 't, A> UnitBreadth for &'i Repetition<'t, A> {
     }
 }
 
+impl<'i, 't, A, T> UnitCoda<T> for &'i Repetition<'t, A>
+where
+    't: 'i,
+    A: 't,
+    T: Invariance,
+    &'i Token<'t, A>: UnitCoda<T>,
+{
+    fn unit_coda(self) -> Variance<T> {
+        use Boundedness::Open;
+        use TokenKind::Separator;
+        use Variance::Variant;
+
+        let variance = components(self.tokens())
+            .last()
+            .into_iter()
+            .flat_map(|component| component.0)
+            // Coalesce tokens with open variance together with separators. This
+            // isn't destructive and doesn't affect invariance, because this
+            // only happens in the presence of open variance, which means that
+            // the repetition is variant (and has no invariant size or text).
+            .coalesce(|left, right| {
+                match (
+                    (left.kind(), left.unit_coda()),
+                    (right.kind(), right.unit_coda()),
+                ) {
+                    ((Separator(_), _), (_, Variant(Open))) => Ok(right),
+                    ((_, Variant(Open)), (Separator(_), _)) => Ok(left),
+                    _ => Err((left, right)),
+                }
+            })
+            .composite_coda();
+        match self.upper {
+            // Repeating invariance can cause overflows, very large allocations,
+            // and very inefficient comparisons (e.g., comparing very large
+            // strings). This is detected by both `encode::compile` and
+            // `rule::check` (in distinct but similar ways). Querying token
+            // trees for their invariance must be done with care (after using
+            // these functions) to avoid expanding pathological invariant
+            // expressions like `<long:9999999999999>`.
+            Some(_) if self.is_converged() => {
+                variance.map_invariance(|invariance| invariance * self.lower)
+            },
+            _ => variance + Variant(Open),
+        }
+    }
+}
+
 impl<'i, 't, A> UnitDepth for &'i Repetition<'t, A> {
     fn unit_depth(self) -> Boundedness {
-        let (_, upper) = self.bounds();
-        if upper.is_none() && self.walk().any(|token| token.is_component_boundary()) {
+        if self.tokens().iter().composite_depth().is_open() {
             Boundedness::Open
         }
         else {
-            Boundedness::Closed
+            let (_, upper) = self.bounds();
+            if upper.is_none() && self.walk().any(|token| token.is_component_boundary()) {
+                Boundedness::Open
+            }
+            else {
+                Boundedness::Closed
+            }
         }
     }
 }
@@ -719,10 +829,10 @@ where
         let variance = self
             .tokens()
             .iter()
-            // Coalesce tokens with open variance with separators. This isn't
-            // destructive and doesn't affect invariance, because this only
-            // happens in the presence of open variance, which means that the
-            // repetition is variant (and has no invariant size or text).
+            // Coalesce tokens with open variance together with separators. This
+            // isn't destructive and doesn't affect invariance, because this
+            // only happens in the presence of open variance, which means that
+            // the repetition is variant (and has no invariant size or text).
             .coalesce(|left, right| {
                 match (
                     (left.kind(), left.unit_variance()),
@@ -760,6 +870,8 @@ impl Separator {
 }
 
 impl<'i> UnitBreadth for &'i Separator {}
+
+impl<'i, 't, T> UnitCoda<T> for &'i Separator where Self: UnitVariance<T> {}
 
 impl<'i> UnitDepth for &'i Separator {}
 
@@ -977,13 +1089,17 @@ impl<T> Deref for WalkEntry<T> {
 
 #[derive(Clone, Debug)]
 pub struct Walk<'i, 't, A> {
-    buffer: VecDeque<WalkEntry<&'i Token<'t, A>>>,
+    is_committing: bool,
+    staged: Vec<WalkEntry<&'i Token<'t, A>>>,
+    committed: VecDeque<WalkEntry<&'i Token<'t, A>>>,
 }
 
 impl<'i, 't, A> Walk<'i, 't, A> {
     fn new(tokens: impl IntoIterator<Item = &'i Token<'t, A>>) -> Self {
         Walk {
-            buffer: tokens
+            is_committing: true,
+            staged: vec![],
+            committed: tokens
                 .into_iter()
                 .enumerate()
                 .map(|(index, token)| WalkEntry {
@@ -1018,10 +1134,17 @@ where
     type Item = WalkEntry<&'i Token<'t, A>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(entry) = self.buffer.pop_front() {
+        if self.is_committing {
+            self.committed.extend(self.staged.drain(..));
+        }
+        else {
+            self.staged.clear();
+        }
+        self.is_committing = true;
+        if let Some(entry) = self.committed.pop_front() {
             match entry.kind() {
                 TokenKind::Alternative(ref alternative) => {
-                    self.buffer
+                    self.staged
                         .extend(alternative.branches().iter().enumerate().flat_map(
                             |(branch, tokens)| {
                                 tokens.iter().map(move |token| WalkEntry {
@@ -1033,7 +1156,7 @@ where
                         ));
                 },
                 TokenKind::Repetition(ref repetition) => {
-                    self.buffer
+                    self.staged
                         .extend(repetition.tokens().iter().map(|token| WalkEntry {
                             parent: Some(entry.position),
                             position: entry.position.converge(),
@@ -1047,6 +1170,16 @@ where
         else {
             None
         }
+    }
+}
+
+impl<'i, 't, A> TreeIterator for Walk<'i, 't, A>
+where
+    't: 'i,
+    A: 't,
+{
+    fn skip_tree(&mut self) {
+        self.is_committing = false;
     }
 }
 
@@ -1125,10 +1258,6 @@ impl<'i, 't, A> Component<'i, 't, A> {
         (tokens, component)
     }
 
-    pub fn tokens(&self) -> &[&'i Token<'t, A>] {
-        self.0.as_ref()
-    }
-
     pub fn literal(&self) -> Option<LiteralSequence<'i, 't>> {
         if self.0.is_empty() {
             None
@@ -1151,12 +1280,28 @@ impl<'i, 't, A> Component<'i, 't, A> {
         }
     }
 
+    pub fn tokens(&self) -> &[&'i Token<'t, A>] {
+        self.0.as_ref()
+    }
+
+    pub fn walk(&self) -> Walk<'i, 't, A> {
+        Walk::new(self.tokens().iter().copied())
+    }
+
     pub fn variance<T>(&self) -> Variance<T>
     where
         T: Invariance,
         &'i Token<'t, A>: UnitVariance<T>,
     {
         self.0.iter().copied().conjunctive_variance()
+    }
+
+    pub fn coda<T>(&self) -> Variance<T>
+    where
+        T: Invariance,
+        &'i Token<'t, A>: UnitCoda<T>,
+    {
+        self.0.iter().copied().composite_coda()
     }
 
     pub fn depth(&self) -> Boundedness {

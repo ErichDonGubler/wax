@@ -17,19 +17,32 @@ pub trait Invariance:
     fn empty() -> Self;
 }
 
-pub trait UnitVariance<T> {
+pub enum Coda {}
+
+pub trait Conjunction<'i, T, C = ()>
+where
+    T: Invariance,
+{
+    type Item: 'i;
+
+    fn conjunction(items: impl IntoIterator<Item = Self::Item>) -> Variance<T>
+    where
+        Self::Item: UnitVariance<T, C>;
+}
+
+pub trait UnitVariance<T, C = ()> {
     fn unit_variance(self) -> Variance<T>;
 }
 
-impl<T> UnitVariance<T> for Variance<T> {
+impl<T, C> UnitVariance<T, C> for Variance<T> {
     fn unit_variance(self) -> Variance<T> {
         self
     }
 }
 
-pub trait ConjunctiveVariance<T>: Iterator + Sized
+pub trait ConjunctiveVariance<T, C = ()>: Iterator + Sized
 where
-    Self::Item: UnitVariance<T>,
+    Self::Item: UnitVariance<T, C>,
     T: Invariance,
 {
     fn conjunctive_variance(self) -> Variance<T> {
@@ -39,17 +52,17 @@ where
     }
 }
 
-impl<T, I> ConjunctiveVariance<T> for I
+impl<T, C, I> ConjunctiveVariance<T, C> for I
 where
     I: Iterator,
-    I::Item: UnitVariance<T>,
+    I::Item: UnitVariance<T, C>,
     T: Invariance,
 {
 }
 
-pub trait DisjunctiveVariance<T>: Iterator + Sized
+pub trait DisjunctiveVariance<T, C = ()>: Iterator + Sized
 where
-    Self::Item: UnitVariance<T>,
+    Self::Item: UnitVariance<T, C>,
     T: Invariance,
 {
     fn disjunctive_variance(self) -> Variance<T> {
@@ -83,38 +96,10 @@ where
     }
 }
 
-impl<T, I> DisjunctiveVariance<T> for I
+impl<T, C, I> DisjunctiveVariance<T, C> for I
 where
     I: Iterator,
-    I::Item: UnitVariance<T>,
-    T: Invariance,
-{
-}
-
-pub trait UnitCoda<T>: Sized + UnitVariance<T> {
-    fn unit_coda(self) -> Variance<T> {
-        self.unit_variance()
-    }
-}
-
-impl<T> UnitCoda<T> for Variance<T> {}
-
-pub trait CompositeCoda<T>: Iterator + Sized
-where
-    Self::Item: UnitCoda<T>,
-    T: Invariance,
-{
-    fn composite_coda(self) -> Variance<T> {
-        self.map(UnitCoda::unit_coda)
-            .reduce(Add::add)
-            .unwrap_or_else(|| Variance::Invariant(T::empty()))
-    }
-}
-
-impl<T, I> CompositeCoda<T> for I
-where
-    I: Iterator,
-    I::Item: UnitCoda<T>,
+    I::Item: UnitVariance<T, C>,
     T: Invariance,
 {
 }
@@ -625,7 +610,11 @@ where
     //    Some((Boundedness::Open, Boundedness::Open)),
     //)
     token::components(tokens).last().map_or(false, |component| {
-        component.depth().is_open() && component.coda::<InvariantText>().boundedness().is_open()
+        let depth = component.depth();
+        let variance = ConjunctiveVariance::<InvariantText, Coda>::conjunctive_variance(
+            component.tokens().iter().copied(),
+        );
+        depth.is_open() && variance.boundedness().is_open()
     })
 }
 

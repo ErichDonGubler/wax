@@ -6,7 +6,7 @@ use std::borrow::Cow;
 use std::cmp;
 use std::collections::VecDeque;
 use std::mem;
-use std::ops::Deref;
+use std::ops::{Add, Deref};
 use std::path::{PathBuf, MAIN_SEPARATOR};
 use std::slice;
 use std::str;
@@ -22,12 +22,269 @@ pub use crate::token::variance::{
     invariant_text_prefix, is_exhaustive, Boundedness, InvariantSize, InvariantText, Variance,
 };
 
+// TODO: Remove this when `Self` projections are stabilized.
+pub trait Annotated<'t> {
+    type Annotation;
+}
+
+pub trait AsTokens<'t> {
+    type Annotation;
+
+    fn as_tokens(&self) -> &[Token<'t, Self::Annotation>];
+}
+
+impl<'i, 't, A> AsTokens<'t> for &'i [Token<'t, A>] {
+    type Annotation = A;
+
+    fn as_tokens(&self) -> &[Token<'t, Self::Annotation>] {
+        *self
+    }
+}
+
+impl<'t, A> AsTokens<'t> for Vec<Token<'t, A>> {
+    type Annotation = A;
+
+    fn as_tokens(&self) -> &[Token<'t, Self::Annotation>] {
+        self.as_slice()
+    }
+}
+
 pub trait TokenTree<'t>: Sized {
     type Annotation;
 
     fn into_tokens(self) -> Vec<Token<'t, Self::Annotation>>;
 
     fn tokens(&self) -> &[Token<'t, Self::Annotation>];
+}
+
+pub trait Junctive {}
+
+#[derive(Clone, Copy, Debug)]
+pub enum Junction<T> {
+    Conjunctive(Conjunctive<T>),
+    Disjunctive(Disjunctive<T>),
+}
+
+impl<T> Junction<T> {
+    pub fn conjuctive(self) -> Option<Conjunctive<T>> {
+        match self {
+            Junction::Conjunctive(conjuctive) => Some(conjuctive),
+            _ => None,
+        }
+    }
+
+    pub fn disjunctive(self) -> Option<Disjunctive<T>> {
+        match self {
+            Junction::Disjunctive(disjuctive) => Some(disjuctive),
+            _ => None,
+        }
+    }
+}
+
+impl<'t, I> Junction<I>
+where
+    I: AsTokens<'t>,
+{
+    pub fn variance<T>(&self) -> Variance<T>
+    where
+        T: Invariance,
+    {
+        match self {
+            Junction::Conjunctive(ref conjunctive) => conjunctive.variance::<T>(),
+            Junction::Disjunctive(ref disjunctive) => disjunctive.variance::<T>(),
+        }
+    }
+}
+
+// TODO: Remove this when `Self` projections are stabilized.
+impl<'t, I> Annotated<'t> for Junction<I>
+where
+    I: AsTokens<'t>,
+{
+    type Annotation = I::Annotation;
+}
+
+impl<T> From<Conjunctive<T>> for Junction<T> {
+    fn from(conjunctive: Conjunctive<T>) -> Self {
+        Junction::Conjunctive(conjunctive)
+    }
+}
+
+impl<T> From<Disjunctive<T>> for Junction<T> {
+    fn from(disjunctive: Disjunctive<T>) -> Self {
+        Junction::Disjunctive(disjunctive)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(transparent)]
+pub struct Conjunctive<T>(T);
+
+impl<'t, I> Conjunctive<I>
+where
+    I: AsTokens<'t>,
+{
+    pub fn components<'i>(
+        &'i self,
+    ) -> impl Iterator<Item = Component<'i, 't, <Self as Annotated<'t>>::Annotation>>
+    where
+        't: 'i,
+    {
+        use LeafTokenKind::Separator;
+
+        self.0
+            .as_tokens()
+            .into_iter()
+            .peekable()
+            .batching(|tokens| {
+                let mut first = tokens.next();
+                while matches!(first.and_then(|token| token.as_leaf()), Some(Separator(_))) {
+                    first = tokens.next();
+                }
+                first.map(|first| match first.as_leaf() {
+                    Some(LeafTokenKind::Wildcard(Wildcard::Tree { .. })) => Component(vec![first]),
+                    _ => Component(
+                        Some(first)
+                            .into_iter()
+                            .chain(
+                                tokens.peeking_take_while(|token| !token.is_component_boundary()),
+                            )
+                            .collect(),
+                    ),
+                })
+            })
+    }
+
+    pub fn variance<T>(&self) -> Variance<T>
+    where
+        T: Invariance,
+    {
+        self.0
+            .as_tokens()
+            .into_iter()
+            .map(Token::variance)
+            .reduce(Add::add)
+            .unwrap_or_else(|| Variance::Invariant(T::empty()))
+    }
+}
+
+// TODO: Remove this when `Self` projections are stabilized.
+impl<'t, I> Annotated<'t> for Conjunctive<I>
+where
+    I: AsTokens<'t>,
+{
+    type Annotation = I::Annotation;
+}
+
+impl<T> AsRef<T> for Conjunctive<T> {
+    fn as_ref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T, U> UnitVariance<U> for Conjunctive<T>
+where
+    T: IntoIterator,
+    T::Item: UnitVariance<U>,
+    U: Invariance,
+{
+    fn unit_variance(self) -> Variance<U> {
+        self.0
+            .into_iter()
+            .map(UnitVariance::unit_variance)
+            .reduce(Add::add)
+            .unwrap_or_else(|| Variance::Invariant(U::empty()))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(transparent)]
+pub struct Disjunctive<T>(T);
+
+impl<'t, I> Disjunctive<I>
+where
+    I: AsTokens<'t>,
+{
+    pub fn variance<T>(&self) -> Variance<T>
+    where
+        T: Invariance,
+    {
+        // TODO: This implementation is incomplete. Unbounded variance (and
+        //       unbounded depth) are "infectious" when disjunctive. If any unit
+        //       variance is variant and unbounded (open), then the disjunctive
+        //       variance should be the same.
+        // There are three distinct possibilities for disjunctive variance.
+        //
+        //   - The iterator is empty and there are no unit variances to
+        //     consider. The disjunctive variance is the empty invariant.
+        //   - The iterator is non-empty and all unit variances are equal. The
+        //     disjunctive variance is the same as any of the like unit
+        //     variances.
+        //   - The iterator is non-empty and the unit variances are **not** all
+        //     equal. The disjunctive variance is variant and bounded (closed).
+        let mut variances = self
+            .0
+            .as_tokens()
+            .into_iter()
+            .map(Token::variance)
+            .fuse();
+        let first = variances
+            .next()
+            .unwrap_or_else(|| Variance::Invariant(T::empty()));
+        variances
+            .all(|variance| first == variance)
+            .then(|| first)
+            .unwrap_or(Variance::Variant(Boundedness::Closed))
+    }
+}
+
+// TODO: Remove this when `Self` projections are stabilized.
+impl<'t, I> Annotated<'t> for Disjunctive<I>
+where
+    I: AsTokens<'t>,
+{
+    type Annotation = I::Annotation;
+}
+
+impl<T> AsRef<T> for Disjunctive<T> {
+    fn as_ref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T, U> UnitVariance<U> for Disjunctive<T>
+where
+    T: IntoIterator,
+    T::Item: UnitVariance<U>,
+    U: Invariance,
+{
+    fn unit_variance(self) -> Variance<U> {
+        // TODO: This implementation is incomplete. Unbounded variance (and
+        //       unbounded depth) are "infectious" when disjunctive. If any unit
+        //       variance is variant and unbounded (open), then the disjunctive
+        //       variance should be the same.
+        // There are three distinct possibilities for disjunctive variance.
+        //
+        //   - The iterator is empty and there are no unit variances to
+        //     consider. The disjunctive variance is the empty invariant.
+        //   - The iterator is non-empty and all unit variances are equal. The
+        //     disjunctive variance is the same as any of the like unit
+        //     variances.
+        //   - The iterator is non-empty and the unit variances are **not** all
+        //     equal. The disjunctive variance is variant and bounded (closed).
+        let mut variances = self
+            .0
+            .into_iter()
+            .map(UnitVariance::unit_variance)
+            .fuse();
+        let first = variances
+            .next()
+            .unwrap_or_else(|| Variance::Invariant(U::empty()));
+        variances
+            .all(|variance| first == variance)
+            .then(|| first)
+            .unwrap_or(Variance::Variant(Boundedness::Closed))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -169,6 +426,33 @@ impl<'t, A> Token<'t, A> {
         Walk::from(self)
     }
 
+    pub fn variance<T>(&self) -> Variance<T>
+    where
+        T: Invariance,
+    {
+        match self.kind() {
+            TokenKind::Branch(ref branch) => branch.variance::<T>(),
+            TokenKind::Leaf(ref leaf) => leaf.variance::<T>(),
+        }
+    }
+
+    pub fn components(&self) -> impl Iterator<Item = Component<'_, 't, A>>
+    where
+        A: 't,
+    {
+        components(self.conjunction())
+    }
+
+    pub fn conjunction(&self) -> Conjunctive<&[Self]> {
+        match self.kind() {
+            TokenKind::Branch(ref branch) => match branch.tokens() {
+                Junction::Conjunctive(tokens) => tokens,
+                _ => Conjunctive(slice::from_ref(self)),
+            },
+            _ => Conjunctive(slice::from_ref(self)),
+        }
+    }
+
     pub fn has_root(&self) -> bool {
         self.walk().starting().any(|(_, token)| {
             matches!(
@@ -248,46 +532,29 @@ where
 
 #[derive(Clone, Debug)]
 pub enum TokenKind<'t, A = ()> {
-    Alternative(Alternative<'t, A>),
-    Class(Class),
-    Literal(Literal<'t>),
-    Repetition(Repetition<'t, A>),
-    Separator(Separator),
-    Wildcard(Wildcard),
+    Branch(BranchTokenKind<'t, A>),
+    Leaf(LeafTokenKind<'t>),
 }
 
 impl<'t, A> TokenKind<'t, A> {
     pub fn into_owned(self) -> TokenKind<'static, A> {
         match self {
-            TokenKind::Alternative(alternative) => alternative.into_owned().into(),
-            TokenKind::Class(class) => TokenKind::Class(class),
-            TokenKind::Literal(Literal {
-                text,
-                is_case_insensitive,
-            }) => TokenKind::Literal(Literal {
-                text: text.into_owned().into(),
-                is_case_insensitive,
-            }),
-            TokenKind::Repetition(repetition) => repetition.into_owned().into(),
-            TokenKind::Separator(_) => TokenKind::Separator(Separator),
-            TokenKind::Wildcard(wildcard) => TokenKind::Wildcard(wildcard),
+            TokenKind::Branch(branch) => branch.into_owned().into(),
+            TokenKind::Leaf(leaf) => leaf.into_owned().into(),
         }
     }
 
     pub fn unannotate(self) -> TokenKind<'t, ()> {
         match self {
-            TokenKind::Alternative(alternative) => TokenKind::Alternative(alternative.unannotate()),
-            TokenKind::Class(class) => TokenKind::Class(class),
-            TokenKind::Literal(literal) => TokenKind::Literal(literal),
-            TokenKind::Repetition(repetition) => TokenKind::Repetition(repetition.unannotate()),
-            TokenKind::Separator(_) => TokenKind::Separator(Separator),
-            TokenKind::Wildcard(wildcard) => TokenKind::Wildcard(wildcard),
+            TokenKind::Branch(branch) => branch.unannotate().into(),
+            TokenKind::Leaf(leaf) => leaf.into(),
         }
     }
 
     pub fn unroot(&mut self) -> bool {
         match self {
-            TokenKind::Wildcard(Wildcard::Tree { ref mut has_root }) => {
+            // TODO: Move this implementation into `Wildcard`.
+            TokenKind::Leaf(LeafTokenKind::Wildcard(Wildcard::Tree { ref mut has_root })) => {
                 mem::replace(has_root, false)
             },
             _ => false,
@@ -302,49 +569,54 @@ impl<'t, A> TokenKind<'t, A> {
         self.unit_variance()
     }
 
-    pub fn has_sub_tokens(&self) -> bool {
-        // It is not necessary to detect empty branches or sub-expressions.
-        matches!(self, TokenKind::Alternative(_) | TokenKind::Repetition(_))
+    pub fn as_branch(&self) -> Option<&BranchTokenKind<'t, A>> {
+        match self {
+            TokenKind::Branch(ref branch) => Some(branch),
+            _ => None,
+        }
+    }
+
+    pub fn as_leaf(&self) -> Option<&LeafTokenKind> {
+        match self {
+            TokenKind::Leaf(ref leaf) => Some(leaf),
+            _ => None,
+        }
+    }
+
+    pub fn is_branch(&self) -> bool {
+        matches!(self, TokenKind::Branch(_))
+    }
+
+    pub fn is_leaf(&self) -> bool {
+        matches!(self, TokenKind::Leaf(_))
     }
 
     pub fn is_component_boundary(&self) -> bool {
-        matches!(
-            self,
-            TokenKind::Separator(_) | TokenKind::Wildcard(Wildcard::Tree { .. })
-        )
+        self.as_leaf()
+            .map_or(false, |leaf| leaf.is_component_boundary())
     }
 
     pub fn is_capturing(&self) -> bool {
-        use TokenKind::{Alternative, Class, Repetition, Wildcard};
+        use BranchTokenKind::{Alternative, Repetition};
+        use LeafTokenKind::{Class, Wildcard};
+        use TokenKind::{Branch, Leaf};
 
         matches!(
             self,
-            Alternative(_) | Class(_) | Repetition(_) | Wildcard(_),
+            Branch(Alternative(_) | Repetition(_)) | Leaf(Class(_) | Wildcard(_)),
         )
     }
 }
 
-impl<'t, A> From<Alternative<'t, A>> for TokenKind<'t, A> {
-    fn from(alternative: Alternative<'t, A>) -> Self {
-        TokenKind::Alternative(alternative)
+impl<'t, A> From<BranchTokenKind<'t, A>> for TokenKind<'t, A> {
+    fn from(branch: BranchTokenKind<'t, A>) -> Self {
+        TokenKind::Branch(branch)
     }
 }
 
-impl<A> From<Class> for TokenKind<'_, A> {
-    fn from(class: Class) -> Self {
-        TokenKind::Class(class)
-    }
-}
-
-impl<'t, A> From<Repetition<'t, A>> for TokenKind<'t, A> {
-    fn from(repetition: Repetition<'t, A>) -> Self {
-        TokenKind::Repetition(repetition)
-    }
-}
-
-impl<A> From<Wildcard> for TokenKind<'static, A> {
-    fn from(wildcard: Wildcard) -> Self {
-        TokenKind::Wildcard(wildcard)
+impl<'t, A> From<LeafTokenKind<'t>> for TokenKind<'t, A> {
+    fn from(leaf: LeafTokenKind<'t>) -> Self {
+        TokenKind::Leaf(leaf)
     }
 }
 
@@ -394,36 +666,158 @@ where
 }
 
 #[derive(Clone, Debug)]
-pub struct Alternative<'t, A = ()>(Vec<Vec<Token<'t, A>>>);
+pub enum BranchTokenKind<'t, A = ()> {
+    Alternative(Alternative<'t, A>),
+    Branch(Branch<'t, A>),
+    Repetition(Repetition<'t, A>),
+}
 
-impl<'t, A> Alternative<'t, A> {
-    pub fn into_owned(self) -> Alternative<'static, A> {
-        Alternative(
-            self.0
-                .into_iter()
-                .map(|tokens| tokens.into_iter().map(Token::into_owned).collect())
-                .collect(),
-        )
+impl<'t, A> BranchTokenKind<'t, A> {
+    pub fn into_owned(self) -> BranchTokenKind<'static, A> {
+        use BranchTokenKind::{Alternative, Branch, Repetition};
+
+        match self {
+            Alternative(alternative) => Alternative(alternative.into_owned()),
+            Branch(branch) => Branch(branch.into_owned()),
+            Repetition(repetition) => Repetition(repetition.into_owned()),
+        }
     }
 
-    pub fn unannotate(self) -> Alternative<'t, ()> {
-        let Alternative(branches) = self;
-        Alternative(
-            branches
-                .into_iter()
-                .map(|branch| branch.into_iter().map(Token::unannotate).collect())
-                .collect(),
-        )
+    pub fn unannotate(self) -> BranchTokenKind<'t, ()> {
+        use BranchTokenKind::{Alternative, Branch, Repetition};
+
+        match self {
+            Alternative(alternative) => Alternative(alternative.unannotate()),
+            Branch(branch) => Branch(branch.unannotate()),
+            Repetition(repetition) => Repetition(repetition.unannotate()),
+        }
     }
 
-    pub fn branches(&self) -> &Vec<Vec<Token<'t, A>>> {
-        &self.0
+    pub fn tokens(&self) -> Junction<&[Token<'t, A>]> {
+        use BranchTokenKind::{Alternative, Branch, Repetition};
+
+        match self {
+            Alternative(alternative) => alternative.tokens().into(),
+            Branch(branch) => branch.tokens().into(),
+            Repetition(repetition) => repetition.tokens().into(),
+        }
+    }
+
+    pub fn variance<T>(&self) -> Variance<T>
+    where
+        T: Invariance,
+    {
+        self.tokens().variance::<T>()
+    }
+
+    pub fn is_conjunctive(&self) -> bool {
+        use BranchTokenKind::{Alternative, Branch, Repetition};
+
+        match self {
+            Alternative(_) => false,
+            Branch(_) | Repetition(_) => true,
+        }
+    }
+
+    pub fn is_disjunctive(&self) -> bool {
+        !self.is_conjunctive()
     }
 }
 
-impl<'t, A> From<Vec<Vec<Token<'t, A>>>> for Alternative<'t, A> {
-    fn from(alternatives: Vec<Vec<Token<'t, A>>>) -> Self {
-        Alternative(alternatives)
+impl<'t, A> From<Alternative<'t, A>> for BranchTokenKind<'t, A> {
+    fn from(alternative: Alternative<'t, A>) -> Self {
+        BranchTokenKind::Alternative(alternative)
+    }
+}
+
+impl<'t, A> From<Branch<'t, A>> for BranchTokenKind<'t, A> {
+    fn from(branch: Branch<'t, A>) -> Self {
+        BranchTokenKind::Branch(branch)
+    }
+}
+
+impl<'t, A> From<Repetition<'t, A>> for BranchTokenKind<'t, A> {
+    fn from(repetition: Repetition<'t, A>) -> Self {
+        BranchTokenKind::Repetition(repetition)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum LeafTokenKind<'t> {
+    Class(Class),
+    Literal(Literal<'t>),
+    Separator(Separator),
+    Wildcard(Wildcard),
+}
+
+impl<'t> LeafTokenKind<'t> {
+    pub fn into_owned(self) -> LeafTokenKind<'static> {
+        use LeafTokenKind::{Class, Literal, Separator, Wildcard};
+
+        match self {
+            Class(class) => Class(class),
+            Literal(literal) => Literal(literal.into_owned()),
+            Separator(separator) => Separator(separator),
+            Wildcard(wildcard) => Wildcard(wildcard),
+        }
+    }
+
+    pub fn is_component_boundary(&self) -> bool {
+        matches!(
+            self,
+            LeafTokenKind::Separator(_) | LeafTokenKind::Wildcard(Wildcard::Tree { .. }),
+        )
+    }
+}
+
+impl From<Class> for LeafTokenKind<'_> {
+    fn from(class: Class) -> Self {
+        LeafTokenKind::Class(class)
+    }
+}
+
+impl<'t> From<Literal<'t>> for LeafTokenKind<'t> {
+    fn from(literal: Literal<'t>) -> Self {
+        LeafTokenKind::Literal(literal)
+    }
+}
+
+impl From<Separator> for LeafTokenKind<'_> {
+    fn from(separator: Separator) -> Self {
+        LeafTokenKind::Separator(separator)
+    }
+}
+
+impl From<Wildcard> for LeafTokenKind<'_> {
+    fn from(wildcard: Wildcard) -> Self {
+        LeafTokenKind::Wildcard(wildcard)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Alternative<'t, A = ()>(Vec<Token<'t, A>>);
+
+impl<'t, A> Alternative<'t, A> {
+    pub fn into_owned(self) -> Alternative<'static, A> {
+        Alternative(self.0.into_iter().map(Token::into_owned).collect())
+    }
+
+    pub fn unannotate(self) -> Alternative<'t, ()> {
+        Alternative(self.0.into_iter().map(Token::unannotate).collect())
+    }
+
+    pub fn tokens(&self) -> Disjunctive<&[Token<'t, A>]> {
+        Disjunctive(self.0.as_slice())
+    }
+
+    pub fn branches(&self) -> Vec<Conjunctive<&[Token<'t, A>]>> {
+        self.0.iter().map(|token| token.conjunction()).collect()
+    }
+}
+
+impl<'t, A> From<Vec<Token<'t, A>>> for Alternative<'t, A> {
+    fn from(tokens: Vec<Token<'t, A>>) -> Self {
+        Alternative(tokens)
     }
 }
 
@@ -516,6 +910,29 @@ impl<'i> UnitVariance<InvariantSize> for &'i Archetype {
 }
 
 #[derive(Clone, Debug)]
+pub struct Branch<'t, A = ()>(Vec<Token<'t, A>>);
+
+impl<'t, A> Branch<'t, A> {
+    pub fn into_owned(self) -> Branch<'static, A> {
+        Branch(self.0.into_iter().map(Token::into_owned).collect())
+    }
+
+    pub fn unannotate(self) -> Branch<'t, ()> {
+        Branch(self.0.into_iter().map(Token::unannotate).collect())
+    }
+
+    pub fn tokens(&self) -> Conjunctive<&[Token<'t, A>]> {
+        Conjunctive(self.0.as_slice())
+    }
+}
+
+impl<'t, A> From<Vec<Token<'t, A>>> for Branch<'t, A> {
+    fn from(tokens: Vec<Token<'t, A>>) -> Self {
+        Branch(tokens)
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Class {
     is_negated: bool,
     archetypes: Vec<Archetype>,
@@ -567,6 +984,17 @@ pub struct Literal<'t> {
 }
 
 impl<'t> Literal<'t> {
+    pub fn into_owned(self) -> Literal<'static> {
+        let Literal {
+            text,
+            is_case_insensitive,
+        } = self;
+        Literal {
+            text: text.into_owned().into(),
+            is_case_insensitive,
+        }
+    }
+
     pub fn text(&self) -> &str {
         self.text.as_ref()
     }
@@ -650,8 +1078,8 @@ impl<'t, A> Repetition<'t, A> {
         }
     }
 
-    pub fn tokens(&self) -> &Vec<Token<'t, A>> {
-        &self.tokens
+    pub fn tokens(&self) -> Conjunctive<&[Token<'t, A>]> {
+        Conjunctive(self.tokens.as_slice())
     }
 
     pub fn bounds(&self) -> (usize, Option<usize>) {
@@ -662,6 +1090,7 @@ impl<'t, A> Repetition<'t, A> {
         self.upper.map_or(false, |upper| self.lower == upper)
     }
 
+    // TODO: Que?
     fn walk(&self) -> Walk<'_, 't, A> {
         Walk::from(&self.tokens)
     }
@@ -780,51 +1209,38 @@ impl<'i> UnitDepth for &'i Wildcard {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Position {
+pub enum Group {
+    Root,
     Conjunctive { depth: usize },
     Disjunctive { depth: usize, branch: usize },
 }
 
-impl Position {
+impl Group {
     pub fn depth(&self) -> usize {
         match self {
-            Position::Conjunctive { ref depth } | Position::Disjunctive { ref depth, .. } => *depth,
+            Group::Root => 0,
+            Group::Conjunctive { ref depth } | Group::Disjunctive { ref depth, .. } => *depth,
         }
     }
 
     // This may appear to operate in place.
     #[must_use]
     fn converge(self) -> Self {
-        match self {
-            Position::Conjunctive { depth } | Position::Disjunctive { depth, .. } => {
-                Position::Conjunctive { depth: depth + 1 }
-            },
-        }
+        let depth = self.depth() + 1;
+        Group::Conjunctive { depth }
     }
 
     // This may appear to operate in place.
     #[must_use]
     fn diverge(self, branch: usize) -> Self {
-        match self {
-            Position::Conjunctive { depth } | Position::Disjunctive { depth, .. } => {
-                Position::Disjunctive {
-                    depth: depth + 1,
-                    branch,
-                }
-            },
-        }
-    }
-}
-
-impl Default for Position {
-    fn default() -> Self {
-        Position::Conjunctive { depth: 0 }
+        let depth = self.depth() + 1;
+        Group::Disjunctive { depth, branch }
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct Walk<'i, 't, A> {
-    buffer: VecDeque<(Position, &'i Token<'t, A>)>,
+    buffer: VecDeque<(Group, &'i Token<'t, A>)>,
 }
 
 impl<'i, 't, A> Walk<'i, 't, A>
@@ -832,13 +1248,13 @@ where
     't: 'i,
     A: 't,
 {
-    pub fn starting(self) -> impl 'i + Iterator<Item = (Position, &'i Token<'t, A>)> {
+    pub fn starting(self) -> impl 'i + Iterator<Item = (Group, &'i Token<'t, A>)> {
         self.peekable().batching(|tokens| {
-            if let Some((position, token)) = tokens.next() {
+            if let Some((group, token)) = tokens.next() {
                 tokens
-                    .peeking_take_while(|(next, _)| *next == position)
+                    .peeking_take_while(|(next, _)| *next == group)
                     .for_each(drop);
-                Some((position, token))
+                Some((group, token))
             }
             else {
                 None
@@ -846,12 +1262,33 @@ where
         })
     }
 
-    pub fn ending(self) -> impl 'i + Iterator<Item = (Position, &'i Token<'t, A>)> {
+    pub fn ending(self) -> impl 'i + Iterator<Item = (Group, &'i Token<'t, A>)> {
         self.peekable().batching(|tokens| {
-            if let Some((position, _)) = tokens.peek().copied() {
-                tokens
-                    .peeking_take_while(|(next, _)| *next == position)
-                    .last()
+            if let Some((group, _)) = tokens.peek().copied() {
+                tokens.peeking_take_while(|(next, _)| *next == group).last()
+            }
+            else {
+                None
+            }
+        })
+    }
+
+    pub fn literals(
+        self,
+    ) -> impl 'i + Iterator<Item = (Group, Component<'i, 't, A>, LiteralSequence<'i, 't>)> {
+        self.peekable().batching(|tokens| {
+            if let Some((group, token)) = tokens.next() {
+                // TODO: The ad-hoc construction of `Conjunctive` here is bad. Is there some way to
+                //       get this information into `Iterator` APIs? Perhaps via a new trait that
+                //       forwards certain implementations?
+                let components = components(Conjunctive(
+                    Some(token).into_iter().chain(
+                        tokens
+                            .peeking_take_while(|(next, _)| *next == group)
+                            .map(|(_, token)| token),
+                    ),
+                ));
+                todo!()
             }
             else {
                 None
@@ -863,17 +1300,18 @@ where
 impl<'i, 't, A> From<&'i Token<'t, A>> for Walk<'i, 't, A> {
     fn from(token: &'i Token<'t, A>) -> Self {
         Walk {
-            buffer: Some((Position::default(), token)).into_iter().collect(),
+            buffer: Some((Group::Root, token)).into_iter().collect(),
         }
     }
 }
 
-impl<'i, 't, A> From<&'i Vec<Token<'t, A>>> for Walk<'i, 't, A> {
-    fn from(tokens: &'i Vec<Token<'t, A>>) -> Self {
+impl<'i, 't, A> From<Conjunctive<&'i [Token<'t, A>]>> for Walk<'i, 't, A> {
+    fn from(tokens: Conjunctive<&'i [Token<'t, A>]>) -> Self {
         Walk {
             buffer: tokens
+                .as_ref()
                 .iter()
-                .map(|token| (Position::default(), token))
+                .map(|token| (Group::Conjunctive { depth: 1 }, token))
                 .collect(),
         }
     }
@@ -884,32 +1322,41 @@ where
     't: 'i,
     A: 't,
 {
-    type Item = (Position, &'i Token<'t, A>);
+    type Item = (Group, &'i Token<'t, A>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some((position, token)) = self.buffer.pop_front() {
-            match token.kind() {
-                TokenKind::Alternative(ref alternative) => {
-                    self.buffer
-                        .extend(alternative.branches().iter().enumerate().flat_map(
-                            |(branch, tokens)| {
-                                tokens
-                                    .iter()
-                                    .map(move |token| (position.diverge(branch), token))
-                            },
-                        ));
-                },
-                TokenKind::Repetition(ref repetition) => {
-                    self.buffer.extend(
-                        repetition
-                            .tokens()
-                            .iter()
-                            .map(|token| (position.converge(), token)),
-                    );
-                },
-                _ => {},
+        use Junction::{Conjunctive, Disjunctive};
+
+        if let Some((group, token)) = self.buffer.pop_front() {
+            if let Some(ref branch) = token.as_branch() {
+                match branch.tokens() {
+                    Conjunctive(tokens) => {
+                        self.buffer.extend(
+                            tokens
+                                .as_ref()
+                                .iter()
+                                .map(|token| (group.converge(), token)),
+                        );
+                    },
+                    Disjunctive(tokens) => {
+                        self.buffer.extend(
+                            tokens
+                                .as_ref()
+                                .iter()
+                                .enumerate()
+                                .map(|(branch, token)| {
+                                    token
+                                        .conjunction()
+                                        .as_ref()
+                                        .iter()
+                                        .map(|token| (group.diverge(branch), token))
+                                })
+                                .flatten(),
+                        );
+                    },
+                }
             }
-            Some((position, token))
+            Some((group, token))
         }
         else {
             None
@@ -954,28 +1401,22 @@ pub struct Component<'i, 't, A = ()>(Vec<&'i Token<'t, A>>);
 
 impl<'i, 't, A> Component<'i, 't, A> {
     pub fn tokens(&self) -> &[&'i Token<'t, A>] {
-        self.0.as_ref()
+        self.0.as_slice()
     }
 
-    pub fn literal(&self) -> Option<LiteralSequence<'i, 't>> {
+    pub fn as_literal(&self) -> Option<LiteralSequence<'i, 't>> {
         if self.0.is_empty() {
             None
         }
         else {
             self.tokens()
                 .iter()
-                .all(|token| matches!(token.kind(), TokenKind::Literal(_)))
-                .then(|| {
-                    LiteralSequence(
-                        self.tokens()
-                            .iter()
-                            .map(|token| match token.kind() {
-                                TokenKind::Literal(ref literal) => literal,
-                                _ => unreachable!(), // See predicate above.
-                            })
-                            .collect(),
-                    )
+                .map(|token| match token.as_leaf() {
+                    Some(LeafTokenKind::Literal(ref literal)) => Some(literal),
+                    _ => None,
                 })
+                .collect::<Option<Vec<_>>>()
+                .map(|literals| LiteralSequence(literals))
         }
     }
 
@@ -1004,40 +1445,53 @@ where
     I::Item: IntoIterator<Item = Token<'t, A>>,
 {
     Token {
-        kind: Alternative(
-            tokens
-                .into_iter()
-                .map(|tokens| tokens.into_iter().map(Token::unannotate).collect())
-                .collect(),
-        )
-        .into(),
+        kind: TokenKind::Branch(
+            Alternative(
+                tokens
+                    .into_iter()
+                    .map(|tokens| tokens.into_iter().map(Token::unannotate).collect())
+                    .collect(),
+            )
+            .into(),
+        ),
         annotation: (),
     }
 }
 
-pub fn components<'i, 't, A, I>(tokens: I) -> impl Iterator<Item = Component<'i, 't, A>>
+pub fn components<'i, 't, A, I>(
+    tokens: Conjunctive<I>,
+) -> impl Iterator<Item = Component<'i, 't, A>>
 where
     't: 'i,
     A: 't,
     I: IntoIterator<Item = &'i Token<'t, A>>,
 {
-    tokens.into_iter().peekable().batching(|tokens| {
-        let mut first = tokens.next();
-        while matches!(first.map(Token::kind), Some(TokenKind::Separator(_))) {
-            first = tokens.next();
-        }
-        first.map(|first| match first.kind() {
-            TokenKind::Wildcard(Wildcard::Tree { .. }) => Component(vec![first]),
-            _ => Component(
-                Some(first)
-                    .into_iter()
-                    .chain(tokens.peeking_take_while(|token| !token.is_component_boundary()))
-                    .collect(),
-            ),
+    use LeafTokenKind::Separator;
+
+    tokens
+        .into_inner()
+        .into_iter()
+        .peekable()
+        .batching(|tokens| {
+            let mut first = tokens.next();
+            while matches!(first.and_then(|token| token.as_leaf()), Some(Separator(_))) {
+                first = tokens.next();
+            }
+            first.map(|first| match first.as_leaf() {
+                Some(LeafTokenKind::Wildcard(Wildcard::Tree { .. })) => Component(vec![first]),
+                _ => Component(
+                    Some(first)
+                        .into_iter()
+                        .chain(tokens.peeking_take_while(|token| !token.is_component_boundary()))
+                        .collect(),
+                ),
+            })
         })
-    })
 }
 
+// TODO: Unlike `components`, this is a **tree** operation (rather than a **level** operation).
+//       This should interact with `Walk` instead. Maybe it's possible to implement `Walk` over
+//       components?
 // TODO: This implementation allocates many `Vec`s.
 pub fn literals<'i, 't, A, I>(
     tokens: I,
@@ -1048,7 +1502,7 @@ where
     I: IntoIterator<Item = &'i Token<'t, A>>,
 {
     components(tokens).flat_map(|component| {
-        if let Some(literal) = component.literal() {
+        if let Some(literal) = component.as_literal() {
             vec![(component, literal)]
         }
         else {

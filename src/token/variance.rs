@@ -1,5 +1,6 @@
 use itertools::Itertools as _;
 use std::borrow::Cow;
+use std::cmp;
 use std::collections::VecDeque;
 use std::ops::{Add, Mul};
 
@@ -556,7 +557,7 @@ where
             },
         }
     }
-    m + 1
+    m + cmp::min(m, 1)
 }
 
 /// Returns `true` if the token tree is exhaustive.

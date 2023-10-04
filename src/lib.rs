@@ -1987,6 +1987,13 @@ mod tests {
     }
 
     #[test]
+    fn partition_empty_glob() {
+        let (prefix, glob) = Glob::new("").unwrap().partition();
+        assert_eq!(prefix, Path::new(""));
+        assert_eq!(format!("{}", glob), "");
+    }
+
+    #[test]
     fn repartition_glob_with_variant_tokens() {
         let (prefix, glob) = Glob::new("/root/**/file.ext").unwrap().partition();
         assert_eq!(prefix, Path::new("/root"));
@@ -1995,6 +2002,14 @@ mod tests {
         let (prefix, glob) = glob.partition();
         assert_eq!(prefix, Path::new(""));
         assert_eq!(format!("{}", glob), "**/file.ext");
+    }
+
+    #[test]
+    fn repartition_empty_glob() {
+        let (_, glob) = Glob::new("").unwrap().partition();
+        let (prefix, glob) = glob.partition();
+        assert_eq!(prefix, Path::new(""));
+        assert_eq!(format!("{}", glob), "");
     }
 
     #[test]

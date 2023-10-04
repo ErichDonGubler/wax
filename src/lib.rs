@@ -35,6 +35,7 @@ mod diagnostics;
 mod encode;
 mod rule;
 mod token;
+mod treeish;
 mod walk;
 
 #[cfg(feature = "miette")]

@@ -125,8 +125,7 @@ pub fn case_folded_eq(left: &str, right: &str) -> bool {
         .expect("failed to compile literal regular expression");
     if let Some(matched) = regex.find(right) {
         matched.start() == 0 && matched.end() == right.len()
-    }
-    else {
+    } else {
         false
     }
 }
@@ -183,8 +182,7 @@ fn encode<'t, A, T>(
                 // TODO: Should Unicode support also be toggled by casing flags?
                 if literal.is_case_insensitive() {
                     pattern.push_str("(?i)");
-                }
-                else {
+                } else {
                     pattern.push_str("(?-i)");
                 }
                 pattern.push_str(&literal.text().escaped());
@@ -222,8 +220,7 @@ fn encode<'t, A, T>(
                     );
                     pattern.push_str(&if let Some(upper) = upper {
                         format!("){{{},{}}}", lower, upper)
-                    }
-                    else {
+                    } else {
                         format!("){{{},}}", lower)
                     });
                     pattern
@@ -253,8 +250,7 @@ fn encode<'t, A, T>(
                         pattern.push('^');
                         encode_class_archetypes(class, &mut pattern);
                         pattern.push_str(SEPARATOR_CLASS_EXPRESSION);
-                    }
-                    else {
+                    } else {
                         encode_class_archetypes(class, &mut pattern);
                         pattern.push_str(nsepexpr!("&&{0}"));
                     }
@@ -266,8 +262,7 @@ fn encode<'t, A, T>(
                     // nothing on supported platforms.
                     if Regex::new(&pattern).is_ok() {
                         pattern.into()
-                    }
-                    else {
+                    } else {
                         NULL_CHARACTER_CLASS.into()
                     }
                 });
@@ -278,11 +273,9 @@ fn encode<'t, A, T>(
             (First, Wildcard(Tree { has_root })) => {
                 if let Some(Middle | Last) = superposition {
                     encode_intermediate_tree(grouping, pattern);
-                }
-                else if *has_root {
+                } else if *has_root {
                     grouping.push_str(pattern, sepexpr!("{0}.*{0}?"));
-                }
-                else {
+                } else {
                     pattern.push_str(sepexpr!("(?:{0}?|"));
                     grouping.push_str(pattern, sepexpr!(".*{0}"));
                     pattern.push(')');
@@ -294,8 +287,7 @@ fn encode<'t, A, T>(
             (Last, Wildcard(Tree { .. })) => {
                 if let Some(First | Middle) = superposition {
                     encode_intermediate_tree(grouping, pattern);
-                }
-                else {
+                } else {
                     pattern.push_str(sepexpr!("(?:{0}?|{0}"));
                     grouping.push_str(pattern, ".*");
                     pattern.push(')');

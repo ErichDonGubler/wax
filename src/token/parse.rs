@@ -70,8 +70,7 @@ impl Display for ErrorEntry<'_> {
             NomErrorKind::Char(expected) => {
                 if let Some(got) = self.fragment.chars().next() {
                     write!(f, "expected `{}`, got `{}`", expected, got)
-                }
-                else {
+                } else {
                     write!(f, "expected `{}`, got end of input", expected)
                 }
             },
@@ -174,7 +173,7 @@ enum FlagToggle {
     CaseInsensitive(bool),
 }
 
-pub fn parse(expression: &str) -> Result<Tokenized, ParseError> {
+pub fn parse(expression: &str) -> Result<Tokenized, ParseError<'_>> {
     use nom::bytes::complete as bytes;
     use nom::character::complete as character;
     use nom::error;
@@ -187,8 +186,7 @@ pub fn parse(expression: &str) -> Result<Tokenized, ParseError> {
     fn boe(input: Input) -> ParseResult<Input> {
         if input.state.subexpression == input.location() {
             Ok((input, input))
-        }
-        else {
+        } else {
             Err(ErrorMode::Error(ErrorStack {
                 errors: vec![(input, NomErrorKind::Context("beginning of expression"))],
             }))
@@ -530,8 +528,7 @@ pub fn parse(expression: &str) -> Result<Tokenized, ParseError> {
             expression: expression.into(),
             tokens: vec![],
         })
-    }
-    else {
+    } else {
         let input = Input::new(Expression::from(expression), ParserState::default());
         let tokens = combinator::all_consuming(glob(combinator::eof))(input)
             .map(|(_, tokens)| tokens)

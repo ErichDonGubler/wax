@@ -55,6 +55,8 @@ features = [
 
 [dependencies.tardar]
 version = "^0.1.0"
+git = "https://github.com/ErichDonGubler/tardar"
+branch = "static-diags"
 optional = true
 
 [dependencies.walkdir]

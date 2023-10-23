@@ -121,8 +121,7 @@ where
                 } => {
                     if let Some(right) = next {
                         Some(Adjacency::Middle { left, item, right })
-                    }
-                    else {
+                    } else {
                         Some(Adjacency::Last { left, item })
                     }
                 },
@@ -361,7 +360,7 @@ impl<'t> TryFrom<&'t str> for Checked<Tokenized<'t>> {
     }
 }
 
-pub fn check(tokenized: Tokenized) -> Result<Checked<Tokenized>, RuleError> {
+pub fn check(tokenized: Tokenized<'_>) -> Result<Checked<Tokenized<'_>>, RuleError> {
     boundary(&tokenized)?;
     bounds(&tokenized)?;
     group(&tokenized)?;
@@ -390,8 +389,7 @@ fn boundary<'t>(tokenized: &Tokenized<'t>) -> Result<(), RuleError<'t>> {
             RuleErrorKind::AdjacentBoundary,
             CompositeSpan::spanned("here", left.union(&right)),
         ))
-    }
-    else {
+    } else {
         Ok(())
     }
 }
@@ -736,8 +734,7 @@ fn bounds<'t>(tokenized: &Tokenized<'t>) -> Result<(), RuleError<'t>> {
             RuleErrorKind::IncompatibleBounds,
             CompositeSpan::spanned("here", *token.annotation()),
         ))
-    }
-    else {
+    } else {
         Ok(())
     }
 }
@@ -760,8 +757,7 @@ fn size<'t>(tokenized: &Tokenized<'t>) -> Result<(), RuleError<'t>> {
             RuleErrorKind::OversizedInvariant,
             CompositeSpan::spanned("here", *token.annotation()),
         ))
-    }
-    else {
+    } else {
         Ok(())
     }
 }

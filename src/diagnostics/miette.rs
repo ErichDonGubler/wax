@@ -19,6 +19,21 @@ pub struct SemanticLiteralWarning<'t> {
     span: SourceSpan,
 }
 
+impl SemanticLiteralWarning<'_> {
+    pub fn into_owned(self) -> SemanticLiteralWarning<'static> {
+        let Self {
+            expression,
+            literal,
+            span,
+        } = self;
+        SemanticLiteralWarning {
+            expression: Cow::Owned(expression.into_owned()),
+            literal: Cow::Owned(literal.into_owned()),
+            span,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Diagnostic, Error)]
 #[diagnostic(code(wax::glob::terminating_separator), severity(warning))]
 #[error("terminating separator may discard matches")]
@@ -29,33 +44,49 @@ pub struct TerminatingSeparatorWarning<'t> {
     span: SourceSpan,
 }
 
+impl TerminatingSeparatorWarning<'_> {
+    pub fn into_owned(self) -> TerminatingSeparatorWarning<'static> {
+        let Self { expression, span } = self;
+        TerminatingSeparatorWarning {
+            expression: Cow::Owned(expression.into_owned()),
+            span,
+        }
+    }
+}
+
 pub fn diagnose<'i, 't>(
     tokenized: &'i Tokenized<'t>,
-) -> impl 'i + Iterator<Item = BoxedDiagnostic<'t>> {
+) -> impl 'i + Iterator<Item = BoxedDiagnostic> {
     None.into_iter()
         .chain(
             token::literals(tokenized.tokens())
                 .filter(|(_, literal)| literal.is_semantic_literal())
                 .map(|(component, literal)| {
-                    Box::new(SemanticLiteralWarning {
-                        expression: tokenized.expression().clone(),
-                        literal: literal.text().clone(),
-                        span: component
-                            .tokens()
-                            .iter()
-                            .map(|token| *token.annotation())
-                            .reduce(|left, right| left.union(&right))
-                            .map(SourceSpan::from)
-                            .expect("no tokens in component"),
-                    }) as BoxedDiagnostic
+                    Box::new(
+                        SemanticLiteralWarning {
+                            expression: tokenized.expression().clone(),
+                            literal: literal.text().clone(),
+                            span: component
+                                .tokens()
+                                .iter()
+                                .map(|token| *token.annotation())
+                                .reduce(|left, right| left.union(&right))
+                                .map(SourceSpan::from)
+                                .expect("no tokens in component"),
+                        }
+                        .into_owned(),
+                    ) as BoxedDiagnostic
                 }),
         )
         .chain(tokenized.tokens().last().into_iter().filter_map(|token| {
             matches!(token.kind(), TokenKind::Separator(_)).then(|| {
-                Box::new(TerminatingSeparatorWarning {
-                    expression: tokenized.expression().clone(),
-                    span: (*token.annotation()).into(),
-                }) as BoxedDiagnostic
+                Box::new(
+                    TerminatingSeparatorWarning {
+                        expression: tokenized.expression().clone(),
+                        span: (*token.annotation()).into(),
+                    }
+                    .into_owned(),
+                ) as BoxedDiagnostic
             })
         }))
 }

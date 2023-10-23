@@ -613,7 +613,7 @@ impl<'t> Glob<'t> {
     /// [`Glob::new`]: crate::Glob::new
     #[cfg(feature = "miette")]
     #[cfg_attr(docsrs, doc(cfg(feature = "miette")))]
-    pub fn diagnosed(expression: &'t str) -> DiagnosticResult<'t, Self> {
+    pub fn diagnosed(expression: &str) -> DiagnosticResult<Self> {
         parse_and_diagnose(expression).and_then_diagnose(|tree| {
             Glob::compile(tree.as_ref().tokens())
                 .into_error_diagnostic()
@@ -850,7 +850,9 @@ impl<'t> Glob<'t> {
     /// [`Glob::partition`]: crate::Glob::partition
     #[cfg(feature = "miette")]
     #[cfg_attr(docsrs, doc(cfg(feature = "miette")))]
-    pub fn diagnose(&self) -> impl Iterator<Item = Box<dyn Diagnostic + '_>> {
+    pub fn diagnose(
+        &self,
+    ) -> impl Iterator<Item = Box<(dyn Diagnostic + Send + Sync + 'static)>> + '_ {
         diagnostics::diagnose(self.tree.as_ref())
     }
 
@@ -1131,8 +1133,7 @@ pub fn escape(unescaped: &str) -> Cow<str> {
             escaped.push(x);
         }
         escaped.into()
-    }
-    else {
+    } else {
         unescaped.into()
     }
 }
@@ -1170,10 +1171,11 @@ fn parse_and_check(expression: &str) -> Result<Checked<Tokenized>, BuildError> {
 }
 
 #[cfg(feature = "miette")]
-fn parse_and_diagnose(expression: &str) -> DiagnosticResult<Checked<Tokenized>> {
+fn parse_and_diagnose(expression: &str) -> DiagnosticResult<Checked<Tokenized<'static>>> {
     token::parse(expression)
+        .map_err(|e| e.into_owned())
         .into_error_diagnostic()
-        .and_then_diagnose(|tokenized| rule::check(tokenized).into_error_diagnostic())
+        .and_then_diagnose(|tokenized| rule::check(tokenized.into_owned()).into_error_diagnostic())
         .and_then_diagnose(|checked| {
             // TODO: This should accept `&Checked`.
             diagnostics::diagnose(checked.as_ref())
